@@ -1,0 +1,38 @@
+name: Soak Test
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  # Relevant docs:
+  # - https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/configuring-pull-request-merges/managing-a-merge-queue#how-merge-queues-work
+  # - https://docs.github.com/en/actions/using-workflows/events-that-trigger-workflows#merge_group
+  merge_group:
+    types: ["checks_requested"]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_GIT_FETCH_WITH_CLI: true
+  SOAK_TEST_DURATION_SECONDS: 120
+  MIN_EXPECTED_THROUGHPUT: 400
+  MAX_EXPECTED_THROUGHPUT: 5000
+  SKIP_GUEST_BUILD: 1
+
+jobs:
+  build:
+    uses: ./.github/workflows/reusable-job.yml
+    with:
+      job-name: "Soak Test"
+      env-vars: "SKIP_GUEST_BUILD=1"
+      cache-tag: "soak"
+      command: |
+        cargo build --release
+        cargo build --release --bin rollup-starter-soak-test -p rollup-starter-soak-test
+        chmod +x scripts/run-soak-test.sh && ./scripts/run-soak-test.sh
+    secrets: inherit

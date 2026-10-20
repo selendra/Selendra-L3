@@ -1,0 +1,43 @@
+[package]
+name = "value-setter"
+authors = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+
+version = { workspace = true }
+readme = "README.md"
+publish = false
+resolver = "2"
+
+[dependencies]
+anyhow = { workspace = true }
+borsh = { workspace = true, features = ["rc"] }
+serde = { workspace = true }
+
+sov-bank = { workspace = true }
+sov-modules-api = { workspace = true }
+sov-state = { workspace = true }
+schemars = { workspace = true }
+
+[dev-dependencies]
+sov-address = { workspace = true, features = ["evm"] }
+value-setter = { path = ".", version = "*", features = ["native"] }
+sov-test-utils = { workspace = true }
+schemars = { workspace = true }
+strum = { workspace = true }
+
+[features]
+default = []
+arbitrary = [
+    "value-setter/arbitrary",
+    "sov-modules-api/arbitrary",
+    "sov-state/arbitrary",
+    "sov-test-utils/arbitrary",
+]
+native = [
+    "value-setter/native",
+    "sov-bank/native",
+    "sov-modules-api/native",
+    "sov-state/native",
+    "sov-address/native",
+]

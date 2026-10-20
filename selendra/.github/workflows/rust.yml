@@ -1,0 +1,120 @@
+name: Rust
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  # Relevant docs:
+  # - https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/configuring-pull-request-merges/managing-a-merge-queue#how-merge-queues-work
+  # - https://docs.github.com/en/actions/using-workflows/events-that-trigger-workflows#merge_group
+  merge_group:
+    types: ["checks_requested"]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_GIT_FETCH_WITH_CLI: true
+
+jobs:
+  lint:
+    uses: ./.github/workflows/reusable-job.yml
+    with:
+      job-name: "Lint"
+      env-vars: 'RUSTFLAGS="-D warnings"'
+      # Lints native project, but also compiles guests on bare metal.
+      # This to enforce update of Cargo.lock fo guests
+      command: "make lint && make check"
+      check-dirty-tree: true
+    secrets: inherit
+
+  test:
+    uses: ./.github/workflows/reusable-job.yml
+    with:
+      job-name: "Test"
+      command: "cargo nextest run"
+      check-dirty-tree: true
+    secrets: inherit
+
+  build-celestia-sp1:
+    uses: ./.github/workflows/reusable-job.yml
+    with:
+      job-name: "Build Celestia SP1"
+      env-vars: "SKIP_GUEST_BUILD=risc0 RUSTFLAGS='-D warnings'"
+      command: "cargo build --no-default-features --features celestia_da,sp1"
+      cache-tag: 'celestia-sp1'
+      check-dirty-tree: true
+    secrets: inherit
+
+  build-celestia-risc0:
+    uses: ./.github/workflows/reusable-job.yml
+    with:
+      job-name: "Build Celestia RISC0"
+      env-vars: "SKIP_GUEST_BUILD=sp1 RUSTFLAGS='-D warnings'"
+      command: "cargo build --no-default-features --features celestia_da,risc0"
+      cache-tag: 'celestia-risc0'
+      check-dirty-tree: true
+    secrets: inherit
+
+  run-readme:
+    if: github.repository == 'Sovereign-Labs/rollup-starter'
+    uses: ./.github/workflows/reusable-job.yml
+    with:
+      job-name: "Run README"
+      env-vars: "SKIP_GUEST_BUILD=1 RUSTFLAGS='-D warnings'"
+      command: |
+        bashtestmd --input README.md --output scripts/rollup-starter.sh --tag=test-ci
+        chmod +x scripts/rollup-starter.sh
+        ./scripts/rollup-starter.sh
+    secrets: inherit
+
+  run-readme-external-mock-da:
+    needs: run-readme
+    if: github.repository == 'Sovereign-Labs/rollup-starter'
+    uses: ./.github/workflows/reusable-job.yml
+    with:
+      job-name: "Run README_EXTERNAL_MOCK_DA"
+      env-vars: "SKIP_GUEST_BUILD=1 RUSTFLAGS='-D warnings'"
+      command: |
+        bashtestmd --input README_EXTERNAL_MOCK_DA.md --output scripts/rollup-starter-external-da.sh --tag=test-ci
+        chmod +x scripts/rollup-starter-external-da.sh
+        ./scripts/rollup-starter-external-da.sh
+    secrets: inherit
+
+  docker-mock-da:
+    name: "Docker Mock DA"
+    runs-on: namespace-profile-sov-ubuntu-24-04-amd64-16x64-rust-1-93-v20260602;container.privileged=true;container.host-pid-namespace=true;overrides.cache-tag=starter-docker-mock-da
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-mock-da
+      - uses: ./.github/actions/teardown-mock-da
+        if: always()
+
+  run-celestia-tutorial:
+    if: github.repository == 'Sovereign-Labs/rollup-starter'
+    uses: ./.github/workflows/reusable-job.yml
+    with:
+      job-name: "Run Celestia Tutorial"
+      env-vars: "SKIP_GUEST_BUILD=1"
+      cache-tag: "celestia"
+      command: |
+        bashtestmd --input GETTING_STARTED_WITH_CELESTIA.md --output scripts/rollup-starter-celestia.sh --tag=test-ci
+        chmod +x scripts/rollup-starter-celestia.sh
+        ./scripts/rollup-starter-celestia.sh
+    secrets: inherit
+
+  run-hyperlane-tutorial:
+    if: github.repository == 'Sovereign-Labs/rollup-starter'
+    uses: ./.github/workflows/reusable-job.yml
+    with:
+      job-name: "Run Hyperlane Tutorial"
+      env-vars: "SKIP_GUEST_BUILD=1"
+      command: |
+        bashtestmd --input GETTING_STARTED_WITH_HYPERLANE.md --output scripts/rollup-starter-hyperlane.sh --tag=test-ci
+        chmod +x scripts/rollup-starter-hyperlane.sh
+        ./scripts/rollup-starter-hyperlane.sh
+    secrets: inherit

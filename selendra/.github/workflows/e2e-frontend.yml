@@ -1,0 +1,145 @@
+name: E2E Frontend Tests
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["main"]
+    paths:
+      - "clients/metamask/**"
+      - "clients/privy/**"
+      - ".github/workflows/e2e-frontend.yml"
+  pull_request:
+    branches: ["main"]
+    paths:
+      - "clients/metamask/**"
+      - "clients/privy/**"
+      - ".github/workflows/e2e-frontend.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-rollup:
+    name: "Build Rollup"
+    runs-on: namespace-profile-sov-ubuntu-24-04-amd64-16x64-rust-1-93-v20260602;container.privileged=true;container.host-pid-namespace=true;overrides.cache-tag=starter-e2e-frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: namespacelabs/nscloud-cache-action@v1
+        with:
+          cache: rust
+
+      - name: Build rollup
+        env:
+          SKIP_GUEST_BUILD: "1"
+        run: cargo build
+
+      - name: Upload rollup binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: rollup-binary
+          path: target/debug/rollup
+          retention-days: 1
+
+  e2e-metamask:
+    name: "MetaMask E2E Tests"
+    runs-on: ubuntu-latest
+    needs: build-rollup
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Download rollup binary
+        uses: actions/download-artifact@v4
+        with:
+          name: rollup-binary
+          path: ./bin
+
+      - name: Start rollup
+        run: |
+          chmod +x ./bin/rollup
+          ./bin/rollup &
+          for i in {1..30}; do
+            curl -sf http://localhost:12346/healthcheck && break
+            echo "Waiting for rollup... ($i)"
+            sleep 2
+          done
+
+      - name: Install dependencies
+        working-directory: clients/metamask
+        run: npm ci
+
+      - name: Install Playwright browsers
+        working-directory: clients/metamask
+        run: npx playwright install chromium --with-deps
+
+      - name: Run E2E tests
+        working-directory: clients/metamask
+        run: npm run test:e2e
+        env:
+          VITE_ROLLUP_URL: http://localhost:12346
+
+      - name: Upload test artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: metamask-playwright-report
+          path: |
+            clients/metamask/playwright-report/
+            clients/metamask/test-results/
+
+  e2e-privy:
+    name: "Privy E2E Tests"
+    runs-on: ubuntu-latest
+    needs: build-rollup
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Download rollup binary
+        uses: actions/download-artifact@v4
+        with:
+          name: rollup-binary
+          path: ./bin
+
+      - name: Start rollup
+        run: |
+          chmod +x ./bin/rollup
+          ./bin/rollup &
+          for i in {1..30}; do
+            curl -sf http://localhost:12346/healthcheck && break
+            echo "Waiting for rollup... ($i)"
+            sleep 2
+          done
+
+      - name: Install dependencies
+        working-directory: clients/privy
+        run: npm ci
+
+      - name: Install Playwright browsers
+        working-directory: clients/privy
+        run: npx playwright install chromium --with-deps
+
+      - name: Run E2E tests
+        working-directory: clients/privy
+        run: npm run test:e2e
+        env:
+          VITE_ROLLUP_URL: http://localhost:12346
+          PRIVY_TEST_EMAIL: ${{ secrets.PRIVY_TEST_EMAIL }}
+          PRIVY_TEST_OTP: ${{ secrets.PRIVY_TEST_OTP }}
+
+      - name: Upload test artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: privy-playwright-report
+          path: |
+            clients/privy/playwright-report/
+            clients/privy/test-results/

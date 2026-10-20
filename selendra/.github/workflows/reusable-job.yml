@@ -1,0 +1,46 @@
+name: Reusable Job
+
+on:
+  workflow_call:
+    inputs:
+      job-name:
+        required: true
+        type: string
+      command:
+        required: true
+        type: string
+      env-vars:
+        required: false
+        type: string
+        default: ""
+      cache-tag:
+        required: false
+        type: string
+        default: "dev"
+      check-dirty-tree:
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  run:
+    name: ${{ inputs.job-name }}
+    runs-on: namespace-profile-sov-ubuntu-24-04-amd64-16x64-rust-1-93-v20260602;container.privileged=true;container.host-pid-namespace=true;overrides.cache-tag=starter-${{ inputs.cache-tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: namespacelabs/nscloud-cache-action@v1
+        with:
+          cache: rust
+          path: |
+            ~/.npm
+            clients/starter-js/node_modules
+
+      - name: Run command
+        env:
+          SP1_PROVER: "mock"
+        run: ${{ inputs.env-vars }} ${{ inputs.command }}
+
+      - name: Exit if working tree is dirty
+        if: ${{ inputs.check-dirty-tree }}
+        run: git diff --exit-code

@@ -1,0 +1,62 @@
+[package]
+name = "acceptance-test"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+build = "build.rs"
+
+[build-dependencies]
+sha2.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono = "0.4"
+clap.workspace = true
+rand = "0.8"
+hex = "0.4.3"
+alloy = { workspace = true }
+alloy-primitives = { workspace = true }
+alloy-rpc-types = { workspace = true }
+alloy-sol-types = { workspace = true, features = ["json"] }
+tracing.workspace = true
+tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
+stf-starter = { path = "../../chain/stf", features = ["mock_da", "native", "acceptance-testing"] }
+sov-bank = { workspace = true, features = ["native"] }
+sov-modules-rollup-blueprint = { workspace = true, features = ["native"] }
+sov-soak-testing-lib.workspace = true
+sov-eth-client = { workspace = true }
+sov-test-state-consistency = { workspace = true }
+sov-test-utils = { workspace = true }
+tokio = { workspace = true }
+reqwest = { version = "0.13", features = ["default-tls"] }
+sov-api-spec.workspace = true
+rollup-starter = { path = "../../chain/node", default-features = false, features = ["mock_da", "mock_zkvm"] }
+sov-modules-api.workspace = true
+borsh.workspace = true
+sov-modules-stf-blueprint.workspace = true
+serde_json.workspace = true
+sov-rollup-interface.workspace = true
+base64 = "0.22.1"
+tokio-stream = "0.1.17"
+futures = "0.3.31"
+thiserror = "2.0.14"
+serde.workspace = true
+serde_yaml = "0.9"
+libc = "0.2"
+sov-rollup-manager = { git = "https://github.com/Sovereign-Labs/sov-rollup-manager", rev = "dd0e4ac1586ee5e852078209afcb295bb888a44f" }
+sov-soak-manager = { git = "https://github.com/Sovereign-Labs/sov-rollup-manager", rev = "dd0e4ac1586ee5e852078209afcb295bb888a44f" }
+sov-versioned-artifact-builder = { git = "https://github.com/Sovereign-Labs/sov-rollup-manager", rev = "dd0e4ac1586ee5e852078209afcb295bb888a44f" }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[[bin]]
+name = "acceptance-test"
+path = "src/main.rs"
+
+[[bin]]
+name = "setup"
+path = "src/bin/setup.rs"

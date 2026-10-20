@@ -23,7 +23,7 @@ A Sovereign rollup is "sovereign" by default: full nodes derive state from DA al
 
 How these parts fit together:
 
-![L3 architecture · rollup, Celestia DA, settlement L2](l3-celestia-architecture.png)
+![L3 architecture · rollup, Celestia DA, settlement L2](docs/architecture.png)
 
 The sequencer submits blobs through consensus gRPC; every node reads them back with proofs from a Celestia node. The highlighted L2 side is where the custom work now sits: the bridge and its security model.
 
