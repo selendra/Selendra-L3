@@ -178,7 +178,94 @@ Each `make start-celestia` creates a **new** Celestia chain, so always run `make
 
 ---
 
-## 5. What is where (files you will edit)
+## 5. Interact with the chain: API, wallet and block explorer
+
+When a node is running (mode A or B), it serves everything on **port 12346**:
+
+| What | URL |
+|---|---|
+| REST API | `http://127.0.0.1:12346` |
+| Swagger UI (try every endpoint in the browser) | <http://127.0.0.1:12346/swagger-ui/> |
+| OpenAPI spec | `http://127.0.0.1:12346/openapi-v3.json` |
+| EVM JSON-RPC (MetaMask, ethers, cast) | `http://127.0.0.1:12346/rpc` |
+| WebSocket subscriptions | `ws://127.0.0.1:12346` (see `clients/starter-js/src/index.ts`) |
+
+### 5.1 Block explorer
+
+```bash
+make selendra-explorer     # serves explorer/ on http://127.0.0.1:8080
+```
+
+Open <http://127.0.0.1:8080>. It is a single static page (`explorer/index.html`, no build step) that reads the node API.
+It shows:
+- the latest blocks and transactions, refreshed every 3 s;
+- block, batch and transaction details, with events and raw JSON;
+- address pages (SEL balance, token balances, activity);
+- tokens with their holders, and the runtime modules.
+
+The search box accepts a block number, a tx hash, a block or batch hash, an `0x…` address or a `token_…` id.
+To point it at another node, change the API address in the top-right corner.
+
+> "Block" in the explorer means a **DA slot** (rollup height). The EVM RPC numbers its blocks differently, so an EVM
+> receipt's `blockNumber` won't match the explorer's block number. EVM transactions don't emit ledger events; their
+> transaction page shows the EVM details (from, to, value) instead.
+
+### 5.2 Read state (curl)
+
+```bash
+curl -s 127.0.0.1:12346/rollup/constants                     # {"chain_id":19610,"chain_name":"Selendra",...}
+curl -s 127.0.0.1:12346/ledger/slots/latest                  # latest block
+curl -s "127.0.0.1:12346/ledger/txs/<hash-or-number>?children=1"  # a tx with its events
+curl -s 127.0.0.1:12346/modules/bank/tokens/gas_token        # SEL token id
+curl -s 127.0.0.1:12346/modules/bank/tokens/<token_id>/balances/<0xChecksummedAddress>
+curl -s -X POST 127.0.0.1:12346/rpc -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"eth_getBalance","params":["0xa6edfca3aa985dd3cc728bffb700933a986ac085","latest"]}'
+```
+
+The bank REST endpoints need the **EIP-55 checksummed** address (mixed case). The EVM RPC accepts lowercase.
+
+### 5.3 Send transactions
+
+```bash
+make selendra-tx                                             # create a token (example call)
+make selendra-transfer TO=0x1111111111111111111111111111111111111111 AMOUNT=2.5   # send 2.5 SEL
+make selendra-transfer TO=0x... AMOUNT=1 TOKEN=token_...     # send another token
+```
+
+`selendra-transfer` runs `clients/starter-js/src/transfer.ts`. It signs with the dev admin key `0xA6ed…`, which holds
+most of the SEL. Set `PRIVATE_KEY=<hex>` to sign with another key. To make any other call, edit `callMessage` in
+`clients/starter-js/src/index.ts` (see §3.3).
+
+### 5.4 MetaMask / EVM tools
+
+Add a network in MetaMask:
+
+| Field | Value |
+|---|---|
+| Network name | Selendra Local |
+| RPC URL | `http://127.0.0.1:12346/rpc` |
+| Chain ID | `19610` |
+| Currency symbol | `SEL` |
+
+Import a dev key from `testing/test-data/keys/` to get funds. `token_deployer_private_key.json` is the rich admin account.
+Plain EVM transfers and contract calls work. For example, with ethers:
+
+```js
+const w = new Wallet("0x<dev key>", new JsonRpcProvider("http://127.0.0.1:12346/rpc"));
+await (await w.sendTransaction({ to: "0x2222…", value: parseEther("1.25") })).wait();
+```
+
+### 5.5 Keep the node running in the background
+
+```bash
+make clean-db && mkdir -p rollup-state
+setsid nohup ./target/debug/rollup --rollup-config-path=configs/mock/rollup.toml \
+  --genesis-path=configs/mock/genesis.json > rollup-state/node.log 2>&1 < /dev/null &
+tail -f rollup-state/node.log          # watch it
+pkill -INT -x rollup                   # stop it
+```
+
+## 6. What is where (files you will edit)
 
 ```
 selendra/
@@ -199,6 +286,7 @@ selendra/
 │   ├── mock/genesis.json          #   genesis balances, sequencer, paymaster, provers
 │   ├── celestia/rollup.toml       #   node config for Celestia (rpc_url, grpc_url, signer key)
 │   └── celestia/genesis.json      #   genesis for Celestia (seq_da_address, genesis_da_height)
+├── explorer/                      # BLOCK EXPLORER — one static page (index.html), served by `make selendra-explorer`
 ├── clients/                       # APPS THAT TALK TO THE CHAIN
 │   ├── starter-js/                #   TypeScript client used by `make selendra-tx`
 │   ├── metamask/  privy/          #   web wallet examples
@@ -234,7 +322,7 @@ don't need SEL to send transactions. To make users pay their own gas, set `"paym
 
 ---
 
-## 6. Useful commands
+## 7. Useful commands
 
 | Command | What it does |
 |---|---|
@@ -244,13 +332,15 @@ don't need SEL to send transactions. To make users pay their own gas, set `"paym
 | `make selendra-celestia` | Run on the Celestia devnet |
 | `make selendra-tx` | Send a test transaction |
 | `make selendra-value` | Read value-setter state |
+| `make selendra-transfer TO=0x… AMOUNT=1.5` | Send SEL (or `TOKEN=token_…`) from the dev admin account |
+| `make selendra-explorer` | Block explorer on http://127.0.0.1:8080 |
 | `make clean-db` | Wipe all chain data (back to genesis) |
 | `make start-obs` / `make stop-obs` | Grafana (`:3000`, admin/admin123) + InfluxDB metrics stack |
 | `cargo test` | Run the rollup's integration tests |
 
 ---
 
-## 7. Troubleshooting
+## 8. Troubleshooting
 
 | Problem | Fix |
 |---|---|
@@ -269,7 +359,7 @@ don't need SEL to send transactions. To make users pay their own gas, set `"paym
 
 ---
 
-## 8. Verified test run
+## 9. Verified test run
 
 Tested on 2026-10-20 on WSL2 Ubuntu 26.04 (16 cores, 11 GB RAM, Docker 29.8, Node 24):
 
@@ -283,7 +373,7 @@ Tested on 2026-10-20 on WSL2 Ubuntu 26.04 (16 cores, 11 GB RAM, Docker 29.8, Nod
 | Batches posted as Celestia blobs, slots keep advancing | n/a | ✅ (2–3 blocks behind head) |
 | Errors in node log | 0 | 0 (only the retry `WARN`s above) |
 
-## 9. Updating Selendra
+## 10. Updating Selendra
 
 | You want to… | Edit | Then |
 |---|---|---|
@@ -323,7 +413,7 @@ to Selendra like this:
 Package names (`rollup-starter`, `stf-starter`, …) were kept on purpose. Upstream diffs and `cargo -p` commands keep
 working, and you can rename them later in one go.
 
-## 10. Next steps
+## 11. Next steps
 
 1. **Add a Selendra module.** Copy `modules/value-setter`, rename it, add it to the workspace `Cargo.toml`
    and to the Runtime in `chain/runtime/src/lib.rs`, then add its genesis to both genesis files.

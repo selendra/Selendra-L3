@@ -133,7 +133,7 @@ print-hyperlane-ethtest-warp:
 # ---------------------------------------------------------------------------
 # Selendra local testnet shortcuts (see docs/LocalSelendra.md)
 # ---------------------------------------------------------------------------
-.PHONY: selendra-mock selendra-celestia selendra-tx selendra-value
+.PHONY: selendra-mock selendra-celestia selendra-tx selendra-value selendra-transfer selendra-explorer
 
 selendra-mock: ## Run Selendra on the local mock DA (no Docker needed)
 	cargo run -- --rollup-config-path=configs/mock/rollup.toml --genesis-path=configs/mock/genesis.json
@@ -146,3 +146,9 @@ selendra-tx: ## Send a test "create token" transaction to the running node
 
 selendra-value: ## Read the value-setter module state from the running node
 	@curl -s http://127.0.0.1:12346/modules/value-setter/state/value; echo
+
+selendra-transfer: ## Send SEL: make selendra-transfer TO=0x... AMOUNT=1.5 [TOKEN=token_...]
+	cd clients/starter-js && npm install --silent && npm run --silent transfer -- $(TO) $(AMOUNT) $(TOKEN)
+
+selendra-explorer: ## Serve the block explorer at http://127.0.0.1:8080 (node must be running)
+	python3 -m http.server 8080 --bind 127.0.0.1 --directory explorer

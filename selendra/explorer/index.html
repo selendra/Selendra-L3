@@ -1,0 +1,377 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Selendra Explorer</title>
+<style>
+:root {
+  --bg: #f6f7f9; --panel: #ffffff; --text: #16191d; --muted: #6a7280; --line: #e3e6ea;
+  --accent: #0b6bcb; --ok: #1a7f37; --bad: #c62828; --warn: #9a6700; --chip: #eef2f6; --code: #f3f5f7;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #0f1216; --panel: #161a20; --text: #e6e8eb; --muted: #949ba6; --line: #262c34;
+          --accent: #5aa9ff; --ok: #4ac26b; --bad: #ff6b6b; --warn: #d4a72c; --chip: #1f252d; --code: #11151a; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+a { color: var(--accent); text-decoration: none; } a:hover { text-decoration: underline; }
+header { background: var(--panel); border-bottom: 1px solid var(--line); }
+.wrap { max-width: 1200px; margin: 0 auto; padding: 0 16px; }
+.top { display: flex; gap: 16px; align-items: center; padding: 12px 0; flex-wrap: wrap; }
+.brand { font-weight: 700; font-size: 18px; color: var(--text); white-space: nowrap; }
+.brand span { color: var(--muted); font-weight: 500; font-size: 13px; margin-left: 6px; }
+nav a { margin-right: 14px; color: var(--muted); } nav a.on { color: var(--text); font-weight: 600; }
+form.search { flex: 1; display: flex; min-width: 260px; }
+form.search input { flex: 1; padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px 0 0 6px; background: var(--bg); color: var(--text); font: inherit; }
+form.search button, button { padding: 8px 12px; border: 1px solid var(--line); background: var(--chip); color: var(--text); font: inherit; cursor: pointer; }
+form.search button { border-radius: 0 6px 6px 0; border-left: 0; }
+button { border-radius: 6px; }
+.api { display: flex; gap: 6px; align-items: center; color: var(--muted); font-size: 12px; }
+.api input { width: 190px; padding: 4px 6px; border: 1px solid var(--line); border-radius: 4px; background: var(--bg); color: var(--text); font: 12px ui-monospace, monospace; }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); display: inline-block; }
+.dot.ok { background: var(--ok); } .dot.bad { background: var(--bad); }
+main.wrap { padding-top: 20px; padding-bottom: 40px; }
+.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 20px; }
+.stat { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; }
+.stat .k { color: var(--muted); font-size: 12px; } .stat .v { font-size: 20px; font-weight: 600; margin-top: 2px; font-variant-numeric: tabular-nums; }
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+@media (max-width: 900px) { .grid2 { grid-template-columns: 1fr; } }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; margin-bottom: 16px; }
+.card h2 { margin: 0; padding: 12px 14px; font-size: 15px; border-bottom: 1px solid var(--line); display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.card h2 small { color: var(--muted); font-weight: 400; font-size: 12px; }
+.scroll { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; }
+th, td { text-align: left; padding: 8px 14px; border-bottom: 1px solid var(--line); white-space: nowrap; vertical-align: top; }
+th { color: var(--muted); font-weight: 500; font-size: 12px; }
+tr:last-child td { border-bottom: 0; }
+td.num { font-variant-numeric: tabular-nums; }
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; }
+.chip { display: inline-block; padding: 1px 8px; border-radius: 10px; background: var(--chip); font-size: 12px; }
+.chip.ok { color: var(--ok); } .chip.bad { color: var(--bad); } .chip.warn { color: var(--warn); }
+.kv { display: grid; grid-template-columns: 180px 1fr; }
+.kv > div { padding: 9px 14px; border-bottom: 1px solid var(--line); word-break: break-all; }
+.kv > div:nth-child(odd) { color: var(--muted); word-break: normal; }
+@media (max-width: 600px) { .kv { grid-template-columns: 1fr; } .kv > div:nth-child(odd) { border-bottom: 0; padding-bottom: 0; } }
+pre { margin: 0; padding: 12px 14px; background: var(--code); overflow: auto; font: 12px/1.5 ui-monospace, monospace; max-height: 520px; }
+.empty { padding: 18px 14px; color: var(--muted); }
+.err { background: var(--panel); border: 1px solid var(--bad); color: var(--bad); border-radius: 8px; padding: 12px 14px; margin-bottom: 16px; }
+.muted { color: var(--muted); }
+h1 { font-size: 20px; margin: 0 0 14px; word-break: break-all; }
+.pager { display: flex; gap: 8px; }
+</style>
+</head>
+<body>
+<header>
+  <div class="wrap top">
+    <a class="brand" href="#/">Selendra <span>Explorer</span></a>
+    <nav>
+      <a href="#/" data-nav="home">Home</a>
+      <a href="#/blocks" data-nav="blocks">Blocks</a>
+      <a href="#/txs" data-nav="txs">Transactions</a>
+      <a href="#/tokens" data-nav="tokens">Tokens</a>
+      <a href="#/modules" data-nav="modules">Modules</a>
+    </nav>
+    <form class="search" id="search">
+      <input id="q" placeholder="Block number · tx hash · block/batch hash · 0x address · token_…" autocomplete="off">
+      <button>Search</button>
+    </form>
+    <div class="api"><span class="dot" id="dot"></span>API <input id="api" spellcheck="false"></div>
+  </div>
+</header>
+<main class="wrap" id="app"></main>
+
+<script>
+// Selendra Explorer — a dependency-free block explorer for a Sovereign SDK rollup.
+// It reads the node's REST API (/ledger, /modules, /rollup) and its EVM JSON-RPC (/rpc).
+const $ = (s) => document.querySelector(s);
+const app = $("#app");
+let API = localStorage.getItem("selendra.api") || new URLSearchParams(location.search).get("api") || "http://127.0.0.1:12346";
+$("#api").value = API;
+$("#api").addEventListener("change", (e) => { API = e.target.value.replace(/\/$/, ""); try { localStorage.setItem("selendra.api", API); } catch {} route(); });
+
+let constants = null, gasToken = null, gasMeta = null, timer = null;
+
+async function get(path) {
+  const r = await fetch(API + path);
+  const body = await r.json().catch(() => null);
+  if (!r.ok) { const e = new Error((body && body.message) || r.statusText); e.status = r.status; throw e; }
+  return body;
+}
+async function tryGet(path) { try { return await get(path); } catch { return null; } }
+async function rpc(method, params = []) {
+  const r = await fetch(API + "/rpc", { method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }) });
+  const j = await r.json(); if (j.error) throw new Error(j.error.message); return j.result;
+}
+
+// ---------- formatting ----------
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const short = (h, n = 8) => (h && h.length > 2 * n + 3 ? `${h.slice(0, n + 2)}…${h.slice(-n)}` : h ?? "");
+const ago = (ms) => { if (!ms) return "—"; const s = Math.max(0, Math.round((Date.now() - ms) / 1000));
+  return s < 60 ? `${s}s ago` : s < 3600 ? `${Math.floor(s / 60)}m ago` : s < 86400 ? `${Math.floor(s / 3600)}h ago` : `${Math.floor(s / 86400)}d ago`; };
+const time = (ms) => (ms ? new Date(ms).toLocaleString() : "—");
+function units(raw, dec = 0) {
+  try { let v = BigInt(raw); const neg = v < 0n; if (neg) v = -v; const b = 10n ** BigInt(dec);
+    const i = (v / b).toLocaleString("en-US"); let f = (v % b).toString().padStart(dec, "0").replace(/0+$/, "");
+    if (f.length > 6) f = /[1-9]/.test(f.slice(0, 6)) ? f.slice(0, 6) + "…" : ""; return (neg ? "-" : "") + i + (f ? "." + f : "");
+  } catch { return String(raw); }
+}
+const blockLink = (n) => `<a href="#/block/${n}">${n}</a>`;
+const txLink = (h, n) => `<a class="mono" href="#/tx/${h}">${esc(short(h, n))}</a>`;
+const addrLink = (a) => `<a class="mono" href="#/address/${a}">${esc(short(a, 6))}</a>`;
+const tokenLink = (t, label) => `<a class="mono" href="#/token/${t}">${esc(label || short(t, 6))}</a>`;
+const result = (r) => { const v = r?.result ?? r; const cls = v === "successful" ? "ok" : v === "reverted" || v === "failed" ? "bad" : "warn";
+  return `<span class="chip ${cls}">${esc(v ?? "?")}</span>`; };
+const finality = (f) => `<span class="chip ${f === "finalized" ? "ok" : "warn"}">${esc(f || "pending")}</span>`;
+const gas = (g) => (Array.isArray(g) ? g.map((x) => Number(x).toLocaleString()).join(" / ") : g ?? "—");
+const raw = (obj) => `<details><summary class="muted" style="padding:10px 14px;cursor:pointer">Raw JSON</summary><pre>${esc(JSON.stringify(obj, null, 2))}</pre></details>`;
+const card = (title, body, extra = "") => `<section class="card"><h2>${title}${extra}</h2>${body}</section>`;
+const table = (heads, rows, emptyMsg = "Nothing yet.") => rows.length
+  ? `<div class="scroll"><table><thead><tr>${heads.map((h) => `<th>${h}</th>`).join("")}</tr></thead><tbody>${rows.join("")}</tbody></table></div>`
+  : `<div class="empty">${emptyMsg}</div>`;
+const kv = (pairs) => `<div class="kv">${pairs.map(([k, v]) => `<div>${k}</div><div>${v}</div>`).join("")}</div>`;
+
+// Pull every address and token id mentioned anywhere in an event payload.
+function addrsIn(obj, out = new Set()) {
+  if (typeof obj === "string" && /^0x[0-9a-fA-F]{40}$/.test(obj)) out.add(obj.toLowerCase());
+  else if (obj && typeof obj === "object") Object.values(obj).forEach((v) => addrsIn(v, out));
+  return out;
+}
+function eventSummary(ev) {
+  const v = ev.value && Object.values(ev.value)[0];
+  if (!v || typeof v !== "object") return "";
+  const parts = [];
+  if (v.from?.user) parts.push(`from ${addrLink(v.from.user)}`);
+  if (v.to?.user) parts.push(`to ${addrLink(v.to.user)}`);
+  if (v.mint_to_address?.user) parts.push(`to ${addrLink(v.mint_to_address.user)}`);
+  if (v.coins) parts.push(`${units(v.coins.amount, v.coins.token_id === gasToken ? 18 : 0)} ${tokenLink(v.coins.token_id, v.coins.token_id === gasToken ? "SEL" : v.token_name || null)}`);
+  return parts.join(" ");
+}
+
+// ---------- chain helpers ----------
+async function latestSlot() { return get("/ledger/slots/latest"); }
+async function totalTxs(slot) {
+  // tx numbers are global: the last batch of the latest slot tells us how many txs exist.
+  for (let s = slot; s && s.number >= 0; ) {
+    if (s.batch_range.end > s.batch_range.start) { const b = await get(`/ledger/batches/${s.batch_range.end - 1}`); return b.tx_range.end; }
+    if (s.batch_range.start === 0) return 0;
+    const b = await get(`/ledger/batches/${s.batch_range.start - 1}`); return b.tx_range.end;
+  }
+  return 0;
+}
+async function slotsDesc(from, count) {
+  const nums = []; for (let n = from; n > from - count && n >= 0; n--) nums.push(n);
+  return (await Promise.all(nums.map((n) => tryGet(`/ledger/slots/${n}?children=1`)))).filter(Boolean);
+}
+async function txsDesc(from, count) {
+  const nums = []; for (let n = from - 1; n >= from - count && n >= 0; n--) nums.push(n);
+  return (await Promise.all(nums.map((n) => tryGet(`/ledger/txs/${n}?children=1`)))).filter(Boolean);
+}
+const slotTxCount = (s) => (s.batches || []).reduce((a, b) => a + (b.tx_range.end - b.tx_range.start), 0);
+const blockRow = (s) => `<tr><td class="num">${blockLink(s.number)}</td><td class="muted">${ago(s.timestamp)}</td>
+  <td class="num">${s.batch_range.end - s.batch_range.start}</td><td class="num">${slotTxCount(s)}</td><td>${finality(s.finality_status)}</td>
+  <td class="mono muted">${esc(short(s.hash))}</td></tr>`;
+const txRow = (t) => `<tr><td class="num">${t.number}</td><td>${txLink(t.hash)}</td>
+  <td>${esc((t.events || []).map((e) => e.key).join(", ") || "—")}</td><td>${result(t.receipt)}</td>
+  <td class="num">${gas(t.receipt?.data?.gas_used)}</td><td><a href="#/batch/${t.batch_number}">${t.batch_number}</a></td></tr>`;
+const txRowShort = (t) => `<tr><td class="num">${t.number}</td><td>${txLink(t.hash, 6)}</td>
+  <td>${esc((t.events || []).map((e) => e.key).join(", ") || "—")}</td><td>${result(t.receipt)}</td></tr>`;
+const BLOCK_HEADS = ["Block", "Age", "Batches", "Txs", "Status", "Hash"];
+const TX_HEADS = ["#", "Hash", "Events", "Result", "Gas used", "Batch"];
+
+// ---------- pages ----------
+async function home() {
+  const [slot, fin, base, sync, counts] = await Promise.all([latestSlot(), tryGet("/ledger/slots/finalized"),
+    tryGet("/rollup/base-fee-per-gas/latest"), tryGet("/rollup/sync-status"), tryGet("/ledger/events/counts")]);
+  const total = await totalTxs(slot);
+  const [blocks, txs] = await Promise.all([slotsDesc(slot.number, 12), txsDesc(total, 12)]);
+  const synced = sync && sync.synced ? `<span class="chip ok">synced</span>` : `<span class="chip warn">syncing</span>`;
+  const stat = (k, v) => `<div class="stat"><div class="k">${k}</div><div class="v">${v}</div></div>`;
+  return `<div class="stats">
+    ${stat("Chain", `${esc(constants?.chain_name ?? "?")} <span class="muted" style="font-size:13px">#${constants?.chain_id ?? "?"}</span>`)}
+    ${stat("Latest block", blockLink(slot.number))}
+    ${stat("Finalized block", fin ? blockLink(fin.number) : "—")}
+    ${stat("Transactions", total.toLocaleString())}
+    ${stat("Events", Object.values(counts || {}).reduce((a, b) => a + b, 0).toLocaleString())}
+    ${stat("Base fee", esc((base?.base_fee_per_gas || []).join(" / ") || "—"))}
+    ${stat("Node", synced)}
+  </div>
+  <div class="grid2">
+    ${card("Latest blocks", table(BLOCK_HEADS, blocks.map(blockRow)), `<small><a href="#/blocks">all →</a></small>`)}
+    ${card("Latest transactions", table(["#", "Hash", "Events", "Result"], txs.map(txRowShort), "No transactions yet. Try <code>make selendra-tx</code>."), `<small><a href="#/txs">all →</a></small>`)}
+  </div>`;
+}
+
+async function blocks(page = 0) {
+  const size = 25, slot = await latestSlot(), from = slot.number - page * size;
+  const list = await slotsDesc(from, size);
+  return card(`Blocks <small>latest ${slot.number}</small>`, table(BLOCK_HEADS, list.map(blockRow)), pager("blocks", page, from - size >= 0));
+}
+async function txs(page = 0) {
+  const size = 25, total = await totalTxs(await latestSlot()), from = total - page * size;
+  const list = await txsDesc(from, size);
+  return card(`Transactions <small>${total} total</small>`, table(TX_HEADS, list.map(txRow), "No transactions yet."), pager("txs", page, from - size > 0));
+}
+const pager = (what, page, more) => `<span class="pager">${page > 0 ? `<a href="#/${what}/p/${page - 1}">← newer</a>` : ""}${more ? `<a href="#/${what}/p/${page + 1}">older →</a>` : ""}</span>`;
+
+async function block(id) {
+  const s = await get(`/ledger/slots/${id}?children=1`);
+  const rows = (s.batches || []).map((b) => `<tr><td>${`<a href="#/batch/${b.number}">${b.number}</a>`}</td><td class="num">${b.tx_range.end - b.tx_range.start}</td>
+    <td class="num">${gas(b.receipt?.gas_used)}</td><td class="num">${gas(b.receipt?.gas_price)}</td><td class="mono muted">${esc(short(b.receipt?.da_address, 6))}</td><td class="mono muted">${esc(short(b.hash))}</td></tr>`);
+  return `<h1>Block ${s.number}</h1>` + card("Overview", kv([
+    ["Block (DA slot)", `${s.number} &nbsp;<a href="#/block/${s.number - 1}">‹ prev</a> &nbsp;<a href="#/block/${s.number + 1}">next ›</a>`],
+    ["Hash", `<span class="mono">${esc(s.hash)}</span>`], ["Time", `${time(s.timestamp)} <span class="muted">(${ago(s.timestamp)})</span>`],
+    ["Status", finality(s.finality_status)], ["Batches", `${s.batch_range.end - s.batch_range.start} (${s.batch_range.start}…${s.batch_range.end - 1})`],
+    ["Transactions", slotTxCount(s)], ["State root", `<span class="mono">${esc(s.state_root)}</span>`]]))
+    + card("Batches", table(["Batch", "Txs", "Gas used", "Gas price", "Sequencer (DA)", "Hash"], rows, "No batches in this block."))
+    + card("Raw", raw(s));
+}
+
+async function batch(id) {
+  const b = await get(`/ledger/batches/${id}?children=1`);
+  const list = await Promise.all((b.txs || []).map((t) => tryGet(`/ledger/txs/${t.number}?children=1`)));
+  return `<h1>Batch ${b.number}</h1>` + card("Overview", kv([
+    ["Batch", b.number], ["Block", blockLink(b.slot_number)], ["Hash", `<span class="mono">${esc(b.hash)}</span>`],
+    ["Transactions", `${b.tx_range.end - b.tx_range.start}`], ["Gas used", gas(b.receipt?.gas_used)], ["Gas price", gas(b.receipt?.gas_price)],
+    ["Sequencer DA address", `<span class="mono">${esc(b.receipt?.da_address)}</span>`],
+    ["Rewards", esc(JSON.stringify(b.receipt?.outcome?.rewards ?? b.receipt?.outcome ?? "—"))]]))
+    + card("Transactions", table(TX_HEADS, list.filter(Boolean).map(txRow), "Empty batch."))
+    + card("Raw", raw(b));
+}
+
+async function tx(id) {
+  const t = await get(`/ledger/txs/${id}?children=1`);
+  const b = await tryGet(`/ledger/batches/${t.batch_number}`);
+  const evRows = (t.events || []).map((e) => `<tr><td class="num">${e.number}</td><td>${esc(e.module?.name)}</td><td>${esc(e.key)}</td><td>${eventSummary(e)}</td></tr>`);
+  const evJson = (t.events || []).map((e) => `<div class="muted" style="padding:8px 14px 0">${esc(e.key)}</div><pre>${esc(JSON.stringify(e.value, null, 2))}</pre>`).join("");
+  // EVM transactions emit no ledger events; fetch their details from the EVM JSON-RPC instead.
+  const evm = (t.events || []).length ? null : await rpc("eth_getTransactionByHash", [t.hash]).catch(() => null);
+  const involved = [...addrsIn(t.events || [])];
+  if (evm) [evm.from, evm.to].filter(Boolean).forEach((x) => !involved.includes(x.toLowerCase()) && involved.push(x.toLowerCase()));
+  const evmCard = evm ? card("EVM transaction", kv([
+    ["From", addrLink(evm.from)], ["To", evm.to ? addrLink(evm.to) : "contract creation"],
+    ["Value", `${units(BigInt(evm.value).toString(), 18)} SEL`], ["Nonce", Number(evm.nonce)],
+    ["Gas limit", Number(evm.gas).toLocaleString()], ["Input", `<span class="mono">${esc(short(evm.input, 24))}</span>`]])) : "";
+  return `<h1>Transaction ${evm ? '<span class="chip">EVM</span>' : ""}</h1>` + card("Overview", kv([
+    ["Hash", `<span class="mono">${esc(t.hash)}</span>`], ["Number", t.number], ["Result", result(t.receipt)],
+    ["Block", b ? blockLink(b.slot_number) : "—"], ["Batch", `<a href="#/batch/${t.batch_number}">${t.batch_number}</a>`],
+    ["Gas used", gas(t.receipt?.data?.gas_used)], ["Addresses involved", involved.map(addrLink).join(", ") || "—"]]))
+    + evmCard
+    + card(`Events <small>${(t.events || []).length}</small>`, table(["#", "Module", "Event", "Summary"], evRows, "No events.") + evJson)
+    + card("Raw", raw(t));
+}
+
+async function scanBalances(filter) {
+  const all = await tryGet("/modules/bank/state/balances/items");
+  return (all?.items || []).filter(filter);
+}
+async function tokenMetaMap() {
+  // state items don't carry decimals, so merge in each token's metadata endpoint.
+  const t = await tryGet("/modules/bank/state/tokens/items");
+  const items = t?.items || [];
+  const metas = await Promise.all(items.map((i) => tryGet(`/modules/bank/tokens/${i.key}/metadata`)));
+  return Object.fromEntries(items.map((i, n) => [i.key, { ...i.value, ...(metas[n] || {}) }]));
+}
+
+async function address(a) {
+  const lower = a.toLowerCase();
+  const [wei, nonce, bals, metas, events] = await Promise.all([
+    rpc("eth_getBalance", [lower, "latest"]).catch(() => null), rpc("eth_getTransactionCount", [lower, "latest"]).catch(() => null),
+    scanBalances((i) => String(i.key?.[0]?.user || "").toLowerCase() === lower), tokenMetaMap(), tryGet("/ledger/events")]);
+  const rows = bals.map((i) => { const m = metas[i.key[1]] || {}; const dec = i.key[1] === gasToken ? 18 : m.decimals ?? 0;
+    return `<tr><td>${tokenLink(i.key[1], m.name)}</td><td class="num">${units(i.value, dec)}</td><td class="mono muted">${esc(short(i.key[1], 6))}</td></tr>`; });
+  const mine = (events || []).filter((e) => addrsIn(e.value).has(lower));
+  const seen = new Set(); const txRows = [];
+  for (const e of mine.reverse()) { if (seen.has(e.tx_hash)) continue; seen.add(e.tx_hash);
+    txRows.push(`<tr><td>${txLink(e.tx_hash)}</td><td>${esc(e.key)}</td><td>${eventSummary(e)}</td></tr>`); }
+  return `<h1 class="mono">${esc(a)}</h1>` + card("Overview", kv([
+    ["SEL balance", wei != null ? `<b>${units(BigInt(wei).toString(), 18)}</b> SEL` : "—"],
+    ["Nonce (EVM)", nonce != null ? Number(nonce) : "—"], ["Tokens held", bals.length]]))
+    + card("Token balances", table(["Token", "Balance", "Token id"], rows, "No balances."))
+    + card(`Activity <small>from events</small>`, table(["Tx", "Event", "Summary"], txRows, "No activity found."));
+}
+
+async function token(id) {
+  const [m, holders] = await Promise.all([get(`/modules/bank/tokens/${id}/metadata`), scanBalances((i) => i.key?.[1] === id)]);
+  const dec = id === gasToken ? 18 : m.decimals;
+  holders.sort((x, y) => (BigInt(y.value) > BigInt(x.value) ? 1 : -1));
+  const rows = holders.map((h) => `<tr><td>${addrLink(h.key[0].user)}</td><td class="num">${units(h.value, dec)}</td></tr>`);
+  return `<h1>${esc(m.name)} ${id === gasToken ? '<span class="chip">gas token</span>' : ""}</h1>` + card("Overview", kv([
+    ["Token id", `<span class="mono">${esc(id)}</span>`], ["Decimals", dec], ["Total supply", units(m.total_supply, dec)],
+    ["Supply cap", units(m.supply_cap, dec)], ["Admins", (m.admins || []).map((x) => addrLink(x.user)).join(", ") || "—"]]))
+    + card(`Holders <small>${holders.length}</small>`, table(["Address", "Balance"], rows));
+}
+
+async function tokens() {
+  const metas = await tokenMetaMap();
+  const rows = Object.entries(metas).map(([id, m]) => { const dec = id === gasToken ? 18 : m.decimals ?? 0;
+    return `<tr><td>${tokenLink(id, m.name)}${id === gasToken ? ' <span class="chip">gas</span>' : ""}</td><td class="num">${units(m.total_supply, dec)}</td><td class="mono muted">${esc(short(id, 8))}</td></tr>`; });
+  return card(`Tokens <small>${rows.length}</small>`, table(["Name", "Total supply", "Token id"], rows));
+}
+
+async function modules() {
+  const m = await get("/modules");
+  const rows = Object.entries(m.modules || {}).map(([name, v]) => `<tr><td>${esc(name)}</td><td class="mono muted">${esc(short(v.id, 10))}</td>
+    <td><a href="${API}/swagger-ui/#/" target="_blank">API ↗</a></td></tr>`);
+  return card(`Runtime modules <small>${rows.length}</small>`, table(["Module", "Id", ""], rows))
+    + card("Chain constants", kv(Object.entries(constants || {}).map(([k, v]) => [esc(k), esc(v)])));
+}
+
+// ---------- search & routing ----------
+$("#search").addEventListener("submit", async (e) => {
+  e.preventDefault(); const q = $("#q").value.trim(); if (!q) return;
+  if (/^\d+$/.test(q)) return (location.hash = `#/block/${q}`);
+  if (/^token_/.test(q)) return (location.hash = `#/token/${q}`);
+  if (/^0x[0-9a-fA-F]{40}$/.test(q)) return (location.hash = `#/address/${q}`);
+  if (/^0x[0-9a-fA-F]{64}$/.test(q)) {
+    if (await tryGet(`/ledger/txs/${q}`)) return (location.hash = `#/tx/${q}`);
+    if (await tryGet(`/ledger/slots/${q}`)) return (location.hash = `#/block/${(await get(`/ledger/slots/${q}`)).number}`);
+    const b = await tryGet(`/ledger/batches/${q}`); if (b) return (location.hash = `#/batch/${b.number}`);
+  }
+  app.innerHTML = `<div class="err">Nothing found for <span class="mono">${esc(q)}</span>.</div>`;
+});
+
+const routes = [
+  [/^#?\/?$/, () => home(), "home", true],
+  [/^#\/blocks(?:\/p\/(\d+))?$/, (m) => blocks(+(m[1] || 0)), "blocks", true],
+  [/^#\/txs(?:\/p\/(\d+))?$/, (m) => txs(+(m[1] || 0)), "txs", true],
+  [/^#\/block\/(.+)$/, (m) => block(m[1]), "blocks"],
+  [/^#\/batch\/(.+)$/, (m) => batch(m[1]), "blocks"],
+  [/^#\/tx\/(.+)$/, (m) => tx(m[1]), "txs"],
+  [/^#\/address\/(.+)$/, (m) => address(m[1]), ""],
+  [/^#\/token\/(.+)$/, (m) => token(m[1]), "tokens"],
+  [/^#\/tokens$/, () => tokens(), "tokens"],
+  [/^#\/modules$/, () => modules(), "modules"],
+];
+
+let renderId = 0;
+async function route(silent = false) {
+  clearTimeout(timer);
+  const h = location.hash || "#/";
+  const [re, fn, nav, live] = routes.find(([re]) => re.test(h)) || routes[0];
+  document.querySelectorAll("nav a").forEach((a) => a.classList.toggle("on", a.dataset.nav === nav));
+  const id = ++renderId;
+  if (!silent) app.innerHTML = `<div class="empty">Loading…</div>`;
+  try {
+    if (!constants) { constants = await get("/rollup/constants"); gasToken = (await tryGet("/modules/bank/tokens/gas_token"))?.token_id; }
+    const html = await fn(h.match(re));
+    if (id !== renderId) return;
+    const open = [...app.querySelectorAll("details[open]")].length;
+    app.innerHTML = html; if (open) app.querySelectorAll("details").forEach((d) => (d.open = true));
+    $("#dot").className = "dot ok";
+  } catch (e) {
+    if (id !== renderId) return;
+    $("#dot").className = "dot bad";
+    app.innerHTML = e.status === 404
+      ? `<div class="err">Not found.</div>`
+      : `<div class="err">Can't reach the Selendra node at <span class="mono">${esc(API)}</span> — ${esc(e.message)}.<br>
+         Start it with <code>make selendra-mock</code> (or <code>make selendra-celestia</code>), or change the API address at the top right.</div>`;
+  }
+  if (live) timer = setTimeout(() => route(true), 3000); // auto-refresh list pages
+}
+window.addEventListener("hashchange", () => route());
+route();
+</script>
+</body>
+</html>
