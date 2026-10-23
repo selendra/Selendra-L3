@@ -176,6 +176,21 @@ make clean-db
 
 Each `make start-celestia` creates a **new** Celestia chain, so always run `make clean-db` before you start Selendra again.
 
+### 4.5 What Selendra posts to Celestia (and what it costs)
+
+The sequencer posts **batches** (and, when proving is on, proofs) as blobs in namespace `selendra-b`.
+Every blob is a Celestia transaction that pays TIA.
+
+| Situation | Upstream SDK | Selendra (patched, `modules/sov-sequencer`) |
+|---|---|---|
+| Transactions arriving | 1 batch per DA block with txs | same: no added latency (measured: on DA in 2–3 s, in the node ledger in ~8–9 s) |
+| Chain idle (no txs) | 1 empty 13-byte batch **every DA block** | 1 empty batch every **~19 DA blocks** (~95% fewer) |
+| Node restart | resends the last ~10–12 batches the node hadn't processed (harmless duplicates) | same |
+
+Tune it with the env var `SOV_SEQUENCER_MAX_IDLE_SLOTS` (default 20, the maximum; `0` = upstream behaviour).
+While idle, the rollup height and clock (and EVM blocks/`block.timestamp`) move in steps of ~19 DA blocks.
+Details, safety reasoning and how to re-apply the patch after an SDK upgrade: [`../modules/patches/README.md`](../modules/patches/README.md).
+
 ---
 
 ## 5. Interact with the chain: API, wallet and block explorer
@@ -283,7 +298,9 @@ selendra/
 │   ├── provers/                   #   zk provers (risc0, sp1) — not used while proving is off
 │   └── node-discovery/            #   small helper binary
 ├── modules/                       # YOUR CUSTOM MODULES — one folder per module
-│   └── value-setter/              #   example module — copy this to make your own
+│   ├── value-setter/              #   example module — copy this to make your own
+│   ├── sov-sequencer/             #   SDK sequencer, patched to skip empty batches (generated — see patches/)
+│   └── patches/                   #   the .patch files + README for sov-sequencer
 ├── configs/                       # CONFIGURATION (no rebuild needed, but `make clean-db` after genesis changes)
 │   ├── mock/rollup.toml           #   node config for mock DA (ports, storage, sequencer)
 │   ├── mock/genesis.json          #   genesis balances, sequencer, paymaster, provers
@@ -341,6 +358,7 @@ don't need SEL to send transactions. To make users pay their own gas, set `"paym
 | `make selendra-evm-demo` | ethers.js walkthrough: deploy an ERC-20, call it, read events |
 | `make selendra-evm-deploy [CONTRACT=…] [ARGS=…]` | Deploy a contract from `clients/evm-ethers/contracts/` |
 | `make selendra-evm-watch [TOKEN=0x…]` | Live blocks and Transfer events over WebSocket |
+| `make selendra-vendor` | Re-vendor the patched SDK sequencer after an SDK rev change |
 | `make clean-db` | Wipe all chain data (back to genesis) |
 | `make start-obs` / `make stop-obs` | Grafana (`:3000`, admin/admin123) + InfluxDB metrics stack |
 | `cargo test` | Run the rollup's integration tests |
@@ -396,6 +414,7 @@ The prover guest crates under `chain/provers/*/guest-*` pin it too. One script u
 
 ```bash
 ./scripts/update_rev.sh <new-sovereign-sdk-commit>   # run from selendra/
+python3 scripts/vendor_sov_sequencer.py              # re-vendor + re-patch the sequencer (modules/patches/README.md)
 cargo update -p sov-modules-api                      # refresh Cargo.lock
 cargo build && cargo test -p rollup-starter          # fix compile errors, then run Mode A and Mode B again
 ```

@@ -1,0 +1,238 @@
+use sov_blob_sender::BlobExecutionStatus;
+use sov_blob_sender::{BlobInternalId, BlobSender, BlobToSend};
+use sov_blob_storage::{PreferredBatchData, PreferredProofData};
+use sov_db::ledger_db::LedgerDb;
+use sov_modules_api::TxHash;
+use sov_rollup_interface::node::da::DaService;
+use sov_shutdown::{BackgroundHandle, PrimaryShutdownController};
+use std::{
+    path::Path,
+    sync::{atomic::AtomicUsize, Arc},
+};
+use tokio::sync::broadcast;
+use tokio::time::Duration;
+use tracing::debug;
+
+use anyhow::Context;
+use borsh::BorshDeserialize;
+
+use super::db::{ReadBatch, ReadBlob};
+use crate::preferred::db::SequencerRole;
+use crate::PreferredProofDataBytes;
+use crate::{common::TxStatusBlobSenderHooks, TxStatusManager};
+
+/// Wrapper around [`BlobSender`] with preferred blob -specific logic.
+pub struct PreferredBlobSender<Da: DaService> {
+    inner: Option<BlobSender<Da, TxStatusBlobSenderHooks<Da::Spec>, LedgerDb>>,
+    nb_of_concurrent_batch_blob_submissions: Arc<AtomicUsize>,
+    nb_of_concurrent_proof_blob_submissions: Arc<AtomicUsize>,
+}
+
+impl<Da: DaService> PreferredBlobSender<Da> {
+    pub(crate) async fn new(
+        da: Da,
+        ledger_db: LedgerDb,
+        all_completed_blobs: Vec<ReadBlob>,
+        storage_path: Box<Path>,
+        tx_status_manager: TxStatusManager<Da::Spec>,
+        primary_shutdown: PrimaryShutdownController,
+        blob_processing_timeout: Duration,
+        blobs_sender_channel: broadcast::Sender<BlobExecutionStatus<Da::Spec>>,
+        seq_role: SequencerRole,
+    ) -> anyhow::Result<(Self, Option<BackgroundHandle<()>>)> {
+        let nb_of_concurrent_batch_blob_submissions = Arc::new(AtomicUsize::new(0));
+        let nb_of_concurrent_proof_blob_submissions = Arc::new(AtomicUsize::new(0));
+        match seq_role {
+            SequencerRole::PgSyncReplica | SequencerRole::DaOnlyReplica => Ok((
+                Self {
+                    inner: None,
+                    nb_of_concurrent_batch_blob_submissions,
+                    nb_of_concurrent_proof_blob_submissions,
+                },
+                None,
+            )),
+            SequencerRole::BatchProducer => {
+                // It's possible that sov-blob-sender's DB might miss some blob data at
+                // node startup due to:
+                //  1. Disk failure (the sequencer can use Postgres so it's durable).
+                //  2. DB corruption.
+                //  3. Node crash at an inconvenient time.
+                // Let's restore all missing blob data to make sure they land on the DA.
+                let blobs_to_send = create_blobs_to_send(all_completed_blobs)?;
+                let (inner, blob_sender_handle) = BlobSender::new(
+                    da.clone(),
+                    ledger_db,
+                    storage_path.as_ref(),
+                    TxStatusBlobSenderHooks::new(tx_status_manager.clone()),
+                    primary_shutdown,
+                    blob_processing_timeout,
+                    Some(blobs_sender_channel),
+                    blobs_to_send,
+                    nb_of_concurrent_batch_blob_submissions.clone(),
+                    nb_of_concurrent_proof_blob_submissions.clone(),
+                )
+                .await?;
+
+                Ok((
+                    Self {
+                        inner: Some(inner),
+                        nb_of_concurrent_batch_blob_submissions,
+                        nb_of_concurrent_proof_blob_submissions,
+                    },
+                    Some(blob_sender_handle),
+                ))
+            }
+        }
+    }
+
+    pub(crate) async fn publish_proof(
+        &mut self,
+        proof_data: PreferredProofDataBytes,
+        sequence_number: u64,
+        blob_id: BlobInternalId,
+    ) -> anyhow::Result<()> {
+        let Some(ref mut inner) = self.inner else {
+            return Ok(());
+        };
+
+        debug!(
+            sequence_number,
+            blob_id, "Dispatching proof blob for publishing"
+        );
+
+        inner.publish_proof_blob(proof_data.0, blob_id).await?;
+
+        Ok(())
+    }
+
+    pub(crate) async fn publish_batch(&mut self, batch: ReadBatch) -> anyhow::Result<()> {
+        let Some(ref mut inner) = self.inner else {
+            return Ok(());
+        };
+
+        let blob_id = batch.blob_id;
+        let data = batch_bytes(batch)?;
+
+        inner.publish_batch_blob(data, blob_id).await?;
+
+        Ok(())
+    }
+
+    pub async fn publish_blobs_for_recovery(
+        &mut self,
+        completed_blobs: Vec<ReadBlob>,
+    ) -> anyhow::Result<()> {
+        for blob in completed_blobs {
+            match blob {
+                ReadBlob::Batch(batch) => {
+                    self.publish_batch(batch).await?;
+                }
+                ReadBlob::Proof {
+                    data,
+                    sequence_number,
+                    blob_id,
+                } => {
+                    self.publish_proof(data, sequence_number, blob_id).await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn nb_of_in_flight_batch_blobs(&self) -> Arc<AtomicUsize> {
+        self.nb_of_concurrent_batch_blob_submissions.clone()
+    }
+
+    pub(crate) fn nb_of_in_flight_proof_blobs(&self) -> Arc<AtomicUsize> {
+        self.nb_of_concurrent_proof_blob_submissions.clone()
+    }
+
+    pub(crate) fn highest_sequence_number_to_send_after_restart(
+        &self,
+    ) -> anyhow::Result<Option<u64>> {
+        let Some(ref inner) = self.inner else {
+            return Ok(None);
+        };
+
+        inner
+            .blobs_to_send_after_restart()
+            .map(preferred_blob_sequence_number)
+            .try_fold(None, |highest, sequence_number| {
+                sequence_number.map(|sequence_number| {
+                    Some(highest.map_or(sequence_number, |highest| {
+                        std::cmp::max(highest, sequence_number)
+                    }))
+                })
+            })
+    }
+
+    pub(crate) async fn add_txs(&self, blob_id: BlobInternalId, tx_hashes: Arc<Vec<TxHash>>) {
+        let Some(ref inner) = self.inner else {
+            return;
+        };
+
+        inner.hooks().add_txs(blob_id, tx_hashes).await;
+    }
+}
+
+pub fn create_blobs_to_send(
+    completed_blobs: Vec<ReadBlob>,
+) -> anyhow::Result<Vec<(BlobToSend, BlobInternalId)>> {
+    let mut blobs_to_send = Vec::new();
+
+    for blob in completed_blobs {
+        match blob {
+            ReadBlob::Batch(batch) => {
+                let blob_id = batch.blob_id;
+                let data = batch_bytes(batch)?;
+                blobs_to_send.push((BlobToSend::Batch { data }, blob_id));
+            }
+            ReadBlob::Proof {
+                data,
+                sequence_number,
+                blob_id,
+                ..
+            } => {
+                debug!(
+                    sequence_number,
+                    blob_id, "Dispatching proof blob for publishing"
+                );
+
+                blobs_to_send.push((BlobToSend::Proof { data: data.0 }, blob_id));
+            }
+        }
+    }
+
+    Ok(blobs_to_send)
+}
+
+pub(crate) fn proof_bytes(
+    proof_data: &[u8],
+    sequence_number: u64,
+) -> anyhow::Result<PreferredProofDataBytes> {
+    let blob = PreferredProofData {
+        sequence_number,
+        data: proof_data.to_vec(),
+    };
+    Ok(PreferredProofDataBytes(borsh::to_vec(&blob)?.into()))
+}
+
+fn batch_bytes(batch: ReadBatch) -> anyhow::Result<Arc<[u8]>> {
+    Ok(borsh::to_vec::<PreferredBatchData>(&PreferredBatchData {
+        sequence_number: batch.sequence_number,
+        visible_slots_to_advance: batch.visible_slots_to_advance,
+        data: batch.txs,
+    })?
+    .into())
+}
+
+fn preferred_blob_sequence_number(blob: &BlobToSend) -> anyhow::Result<u64> {
+    match blob {
+        BlobToSend::Batch { data } => Ok(PreferredBatchData::try_from_slice(data.as_ref())
+            .context("Failed to deserialize preferred batch from BlobSender DB")?
+            .sequence_number),
+        BlobToSend::Proof { data } => Ok(PreferredProofData::try_from_slice(data.as_ref())
+            .context("Failed to deserialize preferred proof from BlobSender DB")?
+            .sequence_number),
+    }
+}

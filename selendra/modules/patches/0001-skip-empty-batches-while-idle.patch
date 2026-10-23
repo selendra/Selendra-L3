@@ -1,0 +1,87 @@
+diff -ruN a/src/preferred/batch_size_tracker.rs b/src/preferred/batch_size_tracker.rs
+--- a/src/preferred/batch_size_tracker.rs
++++ b/src/preferred/batch_size_tracker.rs
+@@ -40,6 +40,11 @@
+         self.current_batch_size += Self::serialized_tx_size(tx_size);
+         self.batch_execution_time_micros += execution_time_micros;
+     }
++
++    /// True when no transaction has been added since the tracker was (re)created at the last batch close.
++    pub fn is_empty(&self) -> bool {
++        self.current_batch_size <= Self::BATCH_SIZE_OVERHEAD
++    }
+ }
+ 
+ #[cfg(test)]
+diff -ruN a/src/preferred/mod.rs b/src/preferred/mod.rs
+--- a/src/preferred/mod.rs
++++ b/src/preferred/mod.rs
+@@ -1070,6 +1070,30 @@
+         .is_some_and(|delta| delta.get() < ideal_lag_behind_finalized_slot)
+ }
+ 
++/// Selendra patch: how many extra DA slots the visible slot may fall behind (on top of
++/// `ideal_lag_behind_finalized_slot`) while the sequencer has nothing to publish, before it posts one
++/// empty batch to catch up. Upstream behaviour is 0 (an empty batch on every DA block).
++///
++/// Set with the `SOV_SEQUENCER_MAX_IDLE_SLOTS` env var; defaults to, and is capped at,
++/// `MAX_VISIBLE_HEIGHT_INCREASE_PER_SLOT`, because one batch can't advance the visible slot further than
++/// that (a larger allowance would only add lag, not save batches).
++fn max_idle_slots() -> u64 {
++    static MAX_IDLE_SLOTS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
++    *MAX_IDLE_SLOTS.get_or_init(|| {
++        let cap: u64 = config_value!("MAX_VISIBLE_HEIGHT_INCREASE_PER_SLOT");
++        let value = match std::env::var("SOV_SEQUENCER_MAX_IDLE_SLOTS") {
++            Ok(raw) => raw.trim().parse::<u64>().unwrap_or_else(|_| {
++                tracing::warn!(%raw, "Invalid SOV_SEQUENCER_MAX_IDLE_SLOTS, using the default");
++                cap
++            }),
++            Err(_) => cap,
++        };
++        let value = value.min(cap);
++        info!(max_idle_slots = value, "Empty batches are published at most once every max_idle_slots DA slots while idle");
++        value
++    })
++}
++
+ fn next_visible_slot_number_increase<S: Spec>(
+     checkpoint: &StateCheckpoint<S>,
+     info: &StateUpdateInfo<S::Storage>,
+diff -ruN a/src/preferred/sync_sequencer_state/inner.rs b/src/preferred/sync_sequencer_state/inner.rs
+--- a/src/preferred/sync_sequencer_state/inner.rs
++++ b/src/preferred/sync_sequencer_state/inner.rs
+@@ -20,7 +20,8 @@
+ use crate::preferred::{comfortable_gas_limit_for_height, PreferredBlobToReplay};
+ use crate::preferred::{
+     current_visible_slot_number_according_to_node, get_next_sequence_number_according_to_node,
+-    is_lagging_less_than_ideal_amount, next_visible_slot_number_increase, BatchCreationError,
++    is_lagging_less_than_ideal_amount, max_idle_slots, next_visible_slot_number_increase,
++    BatchCreationError,
+     Confirmation, PreferredSequencerConfig, PreferredSequencerFetchBatchesToReplayMetrics,
+     TxResultWriter,
+ };
+@@ -473,6 +474,24 @@
+             return;
+         }
+ 
++        // Selendra patch: don't publish an empty batch on every DA block. With no transactions and no proofs
++        // in flight, let the visible slot fall a little further behind and then publish one empty batch that
++        // catches up all of those slots at once. Batches carrying transactions are published exactly as before.
++        if self.batch_size_tracker.is_empty()
++            && self.in_flight_proof_blobs.load(Ordering::Relaxed) == 0
++            && is_lagging_less_than_ideal_amount(
++                self.executor.checkpoint.current_visible_slot_number(),
++                self.latest_info.latest_finalized_slot_number,
++                self.seq_config
++                    .sequencer_kind_config
++                    .ideal_lag_behind_finalized_slot
++                    .saturating_add(max_idle_slots()),
++            )
++        {
++            tracing::trace!("Skipping empty batch: no transactions and still within the idle allowance");
++            return;
++        }
++
+         let in_flight_batch_blobs = self.nb_of_concurrent_batch_blob_submissions();
+         if in_flight_batch_blobs >= COMFORTABLE_IN_FLIGHT_BLOBS {
+             tracing::trace!(

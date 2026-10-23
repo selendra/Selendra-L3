@@ -1,0 +1,362 @@
+use super::*;
+use crate::preferred::db::heartbeat_task::HeartBeatTask;
+use crate::preferred::db::SequencerRole;
+use anyhow::Context;
+use anyhow::Result;
+use sov_db::ledger_db::LedgerDb;
+use sov_modules_api::capabilities::SequencerRemuneration;
+use sov_rollup_full_node_interface::StateUpdateReceiver;
+use std::net::SocketAddr;
+use std::path::Path;
+use std::sync::atomic::AtomicU64;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::{broadcast, mpsc, watch};
+use tracing::debug;
+
+/// Builder for [`PreferredSequencer`] initialization.
+pub struct Builder<S, Rt, Da>
+where
+    S: Spec,
+    Rt: Runtime<S>,
+    Da: DaService<Spec = S::Da>,
+{
+    da: Da,
+    config: SequencerConfig<S::Address, PreferredSequencerConfig<S::Address>>,
+    max_concurrent_proof_blobs: usize,
+    _phantom: PhantomData<(S, Rt)>,
+}
+
+impl<S, Rt, Da> Builder<S, Rt, Da>
+where
+    S: Spec,
+    Rt: Runtime<S>,
+    Da: DaService<Spec = S::Da>,
+{
+    /// Creates a new builder.
+    pub fn new(
+        da: Da,
+        config: SequencerConfig<S::Address, PreferredSequencerConfig<S::Address>>,
+        max_concurrent_proof_blobs: usize,
+    ) -> Self {
+        Self {
+            da,
+            config,
+            max_concurrent_proof_blobs,
+            _phantom: PhantomData,
+        }
+    }
+
+    /// Builds the sequencer instance.
+    pub async fn build(
+        self,
+        state_update_receiver: StateUpdateReceiver<S::Storage>,
+        storage_path: &Path,
+        ledger_db: LedgerDb,
+        api_ledger_db: LedgerDb,
+        primary_shutdown: PrimaryShutdownController,
+        stop_at_rollup_height: Option<RollupHeight>,
+        bind_addr: SocketAddr,
+    ) -> Result<(PreferredSequencer<S, Rt, Da>, Vec<BackgroundHandle<()>>)> {
+        let latest_state_update = state_update_receiver.borrow().clone();
+
+        let da_address = self
+            .da
+            .get_signer()
+            .await
+            .context("Sequencer must have DaService configured with submit support")?;
+
+        // Early check: verify that this node's DA signer matches the preferred
+        // sequencer registered in the runtime.
+        Self::check_runtime_address_match(&latest_state_update, da_address)?;
+
+        debug!(
+            ?latest_state_update,
+            %da_address,
+            "Instantiating the preferred sequencer"
+        );
+
+        let config = self.config;
+        let preferred_config = &config.sequencer_kind_config;
+
+        let tx_status_manager = TxStatusManager::default();
+
+        let (api_state, checkpoint_sender) = Self::api_state(
+            latest_state_update.storage.clone(),
+            primary_shutdown.clone(),
+        );
+
+        let (blobs_sender_channel, _) = broadcast::channel(preferred_config.events_channel_size);
+
+        let (db, seq_role) = PreferredSequencerDb::new(
+            primary_shutdown.clone(),
+            storage_path,
+            &preferred_config.postgres_config,
+            bind_addr,
+        )
+        .await?;
+
+        let (next_sequence_number, db_cache) = db.initial_data().await?;
+        let mut handles = vec![];
+
+        let approximate_block_time = self.da.get_approximate_block_time().await; // Load the block time before moving the DA service to the blob sender
+        let (blob_sender, blob_sender_handle) = PreferredBlobSender::new(
+            self.da,
+            ledger_db.clone(),
+            db_cache.all_proofs_and_completed_blobs().clone(),
+            storage_path.into(),
+            tx_status_manager.clone(),
+            primary_shutdown.clone(),
+            Duration::from_secs(config.blob_processing_timeout_secs),
+            blobs_sender_channel.clone(),
+            seq_role,
+        )
+        .await?;
+
+        if let Some(blob_sender_sequence_number) =
+            blob_sender.highest_sequence_number_to_send_after_restart()?
+        {
+            if blob_sender_sequence_number >= next_sequence_number {
+                primary_shutdown.shutdown();
+                let preferred_db_highest_sequence_number = next_sequence_number
+                    .checked_sub(1)
+                    .map_or_else(|| "none".to_owned(), |seq| seq.to_string());
+                anyhow::bail!(
+                    "Node state is inconsistent, aborting startup: BlobSender DB contains a higher blob sequence number than the Preferred Sequencer DB. BlobSender has blobs up to {blob_sender_sequence_number}, but the preferred sequencer only has blobs up to {preferred_db_highest_sequence_number}. This could mean the preferred sequencer DB was wiped; this is not supported, but to proceed, the BlobSender DB must also be deleted in the rollup state directory. Otherwise, this as a bug, please report it."
+                );
+            }
+        }
+
+        if let Some(blob_sender_handle) = blob_sender_handle {
+            handles.push(blob_sender_handle);
+        }
+
+        let (block_executors_shutdown_notifier, block_executors_shutdown_rx) = mpsc::channel(1);
+        let (state_root_handle, state_root_task) = StateRootTask::create::<Rt>(
+            block_executors_shutdown_rx,
+            !preferred_config.disable_state_root_consistency_checks,
+        );
+        handles.push(state_root_handle);
+
+        let cached_txs = TransactionCache::new(
+            api_ledger_db.clone(),
+            latest_state_update.next_tx_number,
+            preferred_config.events_channel_size,
+        );
+
+        let (executor_events_sender, executor_events_receiver) =
+            ExecutorEventsSender::new(primary_shutdown.clone(), db_cache);
+
+        let in_flight_batch_blobs = blob_sender.nb_of_in_flight_batch_blobs();
+        let in_flight_proof_blobs = blob_sender.nb_of_in_flight_proof_blobs();
+
+        let (forced_tx_batch_notifier, _) = broadcast::channel(1);
+        let rollup_exec_config = RollupBlockExecutorConfig {
+            da_address,
+            shutdown_notifier: block_executors_shutdown_notifier.clone(),
+            state_root_request_sender: state_root_task.request_sender.clone(),
+            primary_shutdown: primary_shutdown.clone(),
+            forced_tx_batch_notifier: forced_tx_batch_notifier.clone(),
+        };
+
+        let (cache_warm_up_executor, workers) = CacheWarmUpExecutor::spawn_execution_task::<Rt>(
+            latest_state_update.clone(),
+            rollup_exec_config.clone(),
+            config.clone(),
+            seq_role,
+        )
+        .await;
+
+        handles.extend(workers);
+
+        let (mut replica_task, start_replica_task_notifier) =
+            ReplicaSyncTask::new(primary_shutdown.clone(), seq_role).await?;
+
+        let tx_queue_id = Arc::new(AtomicU64::new(0));
+        let batch_execution_time_limit_micros =
+            preferred_config.batch_execution_time_limit_millis * 1000;
+        let (synchronized_state, synchronized_state_updator) = create(
+            seq_role,
+            latest_state_update.clone(),
+            tx_queue_id.clone(),
+            batch_execution_time_limit_micros,
+            config.clone(),
+            self.max_concurrent_proof_blobs,
+            primary_shutdown.clone(),
+            executor_events_sender,
+            next_sequence_number,
+            in_flight_batch_blobs,
+            in_flight_proof_blobs,
+            stop_at_rollup_height,
+            rollup_exec_config.clone(),
+            cached_txs.write_handle(),
+            cache_warm_up_executor,
+            start_replica_task_notifier,
+            approximate_block_time,
+        );
+
+        let test_only_state_update_notification_receiver = synchronized_state
+            .test_only_state_update_notification_sender
+            .subscribe();
+        #[cfg(feature = "test-utils")]
+        let test_only_state_update_notification_sender = synchronized_state
+            .test_only_state_update_notification_sender
+            .clone();
+        let synchronized_state_task = synchronized_state.start().await;
+        handles.push(synchronized_state_task);
+
+        let side_effects_task = SideEffectsTask {
+            checkpoint_sender,
+            blob_sender,
+            executor_events_receiver,
+            db,
+            api_ledger_db,
+            primary_shutdown: primary_shutdown.clone(),
+            transaction_cache: cached_txs.write_handle(),
+        }
+        .spawn();
+        handles.push(side_effects_task);
+
+        let synchronized_state_updator = Arc::new(synchronized_state_updator);
+        let execution_backend = SequencerTxExecutionBackend {
+            api_state: api_state.clone(),
+            executor_queue_id: tx_queue_id.clone(),
+            state_updator: synchronized_state_updator.clone(),
+        };
+        let (nonce_buffer_task, nonce_buffer_input) = NonceBufferTask::spawn(
+            execution_backend,
+            preferred_config.maximum_future_nonce_delta,
+            preferred_config.future_nonce_transaction_timeout_millis,
+            forced_tx_batch_notifier.subscribe(),
+            primary_shutdown.clone(),
+        );
+        handles.push(nonce_buffer_task);
+
+        let seq = PreferredSequencer(Arc::new(PreferredSequencerFields {
+            seq_role,
+            synchronized_state_updator: synchronized_state_updator.clone(),
+            tx_status_manager: tx_status_manager.clone(),
+            transaction_cache: cached_txs,
+            blobs_sender_channel: Some(blobs_sender_channel),
+            api_state,
+            _runtime: PhantomData,
+            config: config.clone(),
+            nonce_buffer_input,
+            primary_shutdown: primary_shutdown.clone(),
+            tx_queue_id,
+            stop_at_rollup_height,
+            test_only_state_update_notification_receiver,
+            #[cfg(feature = "test-utils")]
+            test_only_state_update_notification_sender,
+            test_only_forced_tx_batch_notification_receiver: forced_tx_batch_notifier.subscribe(),
+            runtime: Rt::default(),
+        }));
+
+        // Launch replica sync task only for replicas.
+        if let SequencerRole::PgSyncReplica = seq_role {
+            if let Some(postgres_config) = &preferred_config.postgres_config {
+                let replica_task_handle = replica_task
+                    .start(synchronized_state_updator, postgres_config)
+                    .await;
+                handles.push(replica_task_handle.data_fetcher_handle);
+                handles.push(replica_task_handle.sync_task_handle);
+            }
+        }
+
+        // Launch heartbeat tasks for leadership election and node registration
+        if let Some(postgres_config) = &preferred_config.postgres_config {
+            let heartbeat_task = HeartBeatTask::new(
+                postgres_config.clone(),
+                primary_shutdown.clone(),
+                bind_addr,
+                postgres_config.leader_election.heartbeat_interval(),
+            )
+            .await?;
+            let heartbeat_handle = heartbeat_task.spawn(seq_role).await;
+            handles.push(heartbeat_handle);
+        }
+
+        handles.push(BackgroundHandle::spawn(
+            "preferred-update-state",
+            update_state_task(
+                seq.clone(),
+                state_update_receiver.clone(),
+                primary_shutdown.clone(),
+            ),
+        ));
+
+        handles.push(BackgroundHandle::spawn("preferred-tx-notifications", {
+            let ledger_db = ledger_db.clone();
+            let seq = seq.clone();
+            let primary_shutdown = primary_shutdown.clone();
+            async move {
+                loop_send_tx_notifications::<S, Rt>(
+                    state_update_receiver,
+                    primary_shutdown,
+                    &ledger_db,
+                    seq.tx_status_manager(),
+                )
+                .await;
+            }
+        }));
+
+        Ok((seq, handles))
+    }
+
+    fn check_runtime_address_match(
+        latest_state_update: &StateUpdateInfo<<S as Spec>::Storage>,
+        da_address: <<S as Spec>::Da as DaSpec>::Address,
+    ) -> anyhow::Result<()> {
+        let mut runtime: Rt = Default::default();
+        let mut checkpoint =
+            StateCheckpoint::new(latest_state_update.storage.clone(), &runtime.kernel());
+        let registry_preferred = runtime
+            .sequencer_remuneration()
+            .preferred_sequencer(&mut checkpoint);
+        match registry_preferred {
+            Some(ref expected) if *expected == da_address => Ok(()),
+            Some(expected) => {
+                anyhow::bail!(
+                        "DA address mismatch: this node's DaService signer address is {da_address}, \
+                         but the preferred sequencer DA address in the sequencer registry is {expected}. \
+                         Check your DA service configuration."
+                    );
+            }
+            None => {
+                anyhow::bail!(
+                    "No preferred sequencer is registered in the sequencer registry, \
+                         but this node is configured as a preferred sequencer. \
+                         Check the sequencer registry genesis configuration."
+                );
+            }
+        }
+    }
+
+    fn api_state(
+        storage: S::Storage,
+        primary_shutdown: PrimaryShutdownController,
+    ) -> (
+        ApiState<S>,
+        watch::Sender<Arc<ConcurrentStateCheckpoint<S>>>,
+    ) {
+        let mut runtime: Rt = Default::default();
+        assert!(
+            accepts_preferred_batches(runtime.blob_selector()),
+            "Attempting to use preferred sequencer with an incompatible rollup. Set your sequencer config to `standard` in your rollup's config.toml file or change your kernel to be compatible with soft confirmations."
+        );
+        let checkpoint = StateCheckpoint::new(storage, &runtime.kernel());
+        // Preferred sequencer deliberately treats the latest available slot as finalized
+        // when initializing API state (soft-confirmation semantics).
+        let concurrent_checkpoint = ConcurrentStateCheckpoint::from_state_checkpoint(checkpoint);
+        let (checkpoint_sender, checkpoint_receiver) =
+            watch::channel(Arc::new(concurrent_checkpoint));
+        let api_state = ApiState::build(
+            Arc::new(()),
+            checkpoint_receiver,
+            runtime.kernel_with_slot_mapping(),
+            None,
+            primary_shutdown,
+        );
+        (api_state, checkpoint_sender)
+    }
+}

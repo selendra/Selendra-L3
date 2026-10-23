@@ -164,3 +164,6 @@ selendra-evm-watch: ## Stream new blocks (and Transfer events of TOKEN=0x...) ov
 
 selendra-evm-compat: ## EVM compatibility suite: RPC methods, tx types, opcodes, precompiles, contracts, errors, logs, limits
 	cd clients/evm-ethers && npm install --silent && npm run --silent compat
+
+selendra-vendor: ## Re-vendor the patched SDK sequencer (modules/sov-sequencer) from the SDK rev in Cargo.toml
+	python3 scripts/vendor_sov_sequencer.py

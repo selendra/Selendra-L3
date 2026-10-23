@@ -49,3 +49,6 @@ FILES=(
 for file in "${FILES[@]}"; do
     update_revision "$file"
 done
+
+echo
+echo "Next: re-vendor the patched sequencer for the new rev:  python3 scripts/vendor_sov_sequencer.py $NEW_REV"

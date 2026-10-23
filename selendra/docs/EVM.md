@@ -116,7 +116,7 @@ make selendra-evm-compat      # clients/evm-ethers/test/compat.js + test/contrac
 ```
 
 Result on 2026-10-23 (local mock DA, SDK rev `f1a2dc3`): **65/65 required checks pass, 6 known differences from
-Ethereum, and 24 optional or newer-fork features not available.**
+Ethereum (plus the block-timestamp behaviour found afterwards, #7), and 24 optional or newer-fork features not available.**
 
 ### ✅ Works like Ethereum
 
@@ -142,6 +142,7 @@ Ethereum, and 24 optional or newer-fork features not available.**
 | 4 | **Contract size limit is 512 KiB, not 24 KB (EIP-170).** It is set in genesis: `evm.chain_spec.limit_contract_code_size = 524288`. | Set it to `24576` in `configs/*/genesis.json` for strict Ethereum parity. That is a genesis change, so run `make clean-db`. The admin can also change it later through the EVM module's `ChainSpecUpdate`. |
 | 5 | **`SELFDESTRUCT` of a contract created in the same tx fails** (`selfdestruct unsupported`), where Ethereum would delete it. `SELFDESTRUCT` on older contracts works (EIP-6780 behaviour). | The opcode is deprecated; avoid factory patterns that create and destroy in one tx. |
 | 6 | **Nonce lag right after a confirmation** (described below). | Use `SelendraWallet` (ethers) or keep the nonce in your client. |
+| 7 | **On an idle chain, EVM blocks and `block.timestamp` advance in steps.** New EVM blocks come with rollup batches. While idle, Selendra posts an empty batch only every ~19 DA blocks (~2 min; see `modules/patches/README.md`), and a block's timestamp is that of the last block with txs. Measured before the batch patch: 612 s stale before a tx, 20 s after. | Don't rely on `block.timestamp` in `eth_call`/view functions being current on a quiet chain. Pass the time in from the client, or check it inside a transaction. |
 
 ### ❌ Not available (N/A)
 
