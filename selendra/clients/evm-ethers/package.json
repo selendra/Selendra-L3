@@ -1,0 +1,18 @@
+{
+  "name": "selendra-evm-ethers",
+  "version": "1.0.0",
+  "description": "Use Selendra as an EVM chain with ethers.js: compile, deploy and interact with Solidity contracts",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "compile": "node src/compile.js",
+    "deploy": "node src/deploy.js",
+    "demo": "node src/demo.js",
+    "watch": "node src/watch.js",
+    "compat": "node test/compat.js"
+  },
+  "dependencies": {
+    "ethers": "6.15.0",
+    "solc": "0.8.28"
+  }
+}

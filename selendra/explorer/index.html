@@ -247,12 +247,16 @@ async function tx(id) {
   const evJson = (t.events || []).map((e) => `<div class="muted" style="padding:8px 14px 0">${esc(e.key)}</div><pre>${esc(JSON.stringify(e.value, null, 2))}</pre>`).join("");
   // EVM transactions emit no ledger events; fetch their details from the EVM JSON-RPC instead.
   const evm = (t.events || []).length ? null : await rpc("eth_getTransactionByHash", [t.hash]).catch(() => null);
+  const rc = evm ? await rpc("eth_getTransactionReceipt", [t.hash]).catch(() => null) : null;
   const involved = [...addrsIn(t.events || [])];
-  if (evm) [evm.from, evm.to].filter(Boolean).forEach((x) => !involved.includes(x.toLowerCase()) && involved.push(x.toLowerCase()));
+  if (evm) [evm.from, evm.to, rc?.contractAddress].filter(Boolean).forEach((x) => !involved.includes(x.toLowerCase()) && involved.push(x.toLowerCase()));
   const evmCard = evm ? card("EVM transaction", kv([
-    ["From", addrLink(evm.from)], ["To", evm.to ? addrLink(evm.to) : "contract creation"],
+    ["Status", rc ? result(rc.status === "0x1" ? "successful" : "reverted") : "—"],
+    ["From", addrLink(evm.from)], ["To", evm.to ? addrLink(evm.to) : `contract creation → ${rc?.contractAddress ? addrLink(rc.contractAddress) : "?"}`],
     ["Value", `${units(BigInt(evm.value).toString(), 18)} SEL`], ["Nonce", Number(evm.nonce)],
-    ["Gas limit", Number(evm.gas).toLocaleString()], ["Input", `<span class="mono">${esc(short(evm.input, 24))}</span>`]])) : "";
+    ["Gas limit / used", `${Number(evm.gas).toLocaleString()} / ${rc ? Number(rc.gasUsed).toLocaleString() : "—"}`],
+    ["Logs", rc ? (rc.logs || []).map((l) => `${addrLink(l.address)} <span class="mono muted">${esc(short(l.topics?.[0], 6))}</span>`).join("<br>") || "none" : "—"],
+    ["Input", `<span class="mono">${esc(short(evm.input, 24))}</span>`]])) : "";
   return `<h1>Transaction ${evm ? '<span class="chip">EVM</span>' : ""}</h1>` + card("Overview", kv([
     ["Hash", `<span class="mono">${esc(t.hash)}</span>`], ["Number", t.number], ["Result", result(t.receipt)],
     ["Block", b ? blockLink(b.slot_number) : "—"], ["Batch", `<a href="#/batch/${t.batch_number}">${t.batch_number}</a>`],
@@ -276,8 +280,9 @@ async function tokenMetaMap() {
 
 async function address(a) {
   const lower = a.toLowerCase();
-  const [wei, nonce, bals, metas, events] = await Promise.all([
+  const [wei, nonce, code, bals, metas, events] = await Promise.all([
     rpc("eth_getBalance", [lower, "latest"]).catch(() => null), rpc("eth_getTransactionCount", [lower, "latest"]).catch(() => null),
+    rpc("eth_getCode", [lower, "latest"]).catch(() => null),
     scanBalances((i) => String(i.key?.[0]?.user || "").toLowerCase() === lower), tokenMetaMap(), tryGet("/ledger/events")]);
   const rows = bals.map((i) => { const m = metas[i.key[1]] || {}; const dec = i.key[1] === gasToken ? 18 : m.decimals ?? 0;
     return `<tr><td>${tokenLink(i.key[1], m.name)}</td><td class="num">${units(i.value, dec)}</td><td class="mono muted">${esc(short(i.key[1], 6))}</td></tr>`; });
@@ -287,6 +292,7 @@ async function address(a) {
     txRows.push(`<tr><td>${txLink(e.tx_hash)}</td><td>${esc(e.key)}</td><td>${eventSummary(e)}</td></tr>`); }
   return `<h1 class="mono">${esc(a)}</h1>` + card("Overview", kv([
     ["SEL balance", wei != null ? `<b>${units(BigInt(wei).toString(), 18)}</b> SEL` : "—"],
+    ["Type", code && code !== "0x" ? `<span class="chip">EVM contract</span> ${((code.length - 2) / 2).toLocaleString()} bytes of code` : "Account"],
     ["Nonce (EVM)", nonce != null ? Number(nonce) : "—"], ["Tokens held", bals.length]]))
     + card("Token balances", table(["Token", "Balance", "Token id"], rows, "No balances."))
     + card(`Activity <small>from events</small>`, table(["Tx", "Event", "Summary"], txRows, "No activity found."));

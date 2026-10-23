@@ -133,7 +133,7 @@ print-hyperlane-ethtest-warp:
 # ---------------------------------------------------------------------------
 # Selendra local testnet shortcuts (see docs/LocalSelendra.md)
 # ---------------------------------------------------------------------------
-.PHONY: selendra-mock selendra-celestia selendra-tx selendra-value selendra-transfer selendra-explorer
+.PHONY: selendra-mock selendra-celestia selendra-tx selendra-value selendra-transfer selendra-explorer selendra-evm-demo selendra-evm-deploy selendra-evm-watch selendra-evm-compat
 
 selendra-mock: ## Run Selendra on the local mock DA (no Docker needed)
 	cargo run -- --rollup-config-path=configs/mock/rollup.toml --genesis-path=configs/mock/genesis.json
@@ -152,3 +152,15 @@ selendra-transfer: ## Send SEL: make selendra-transfer TO=0x... AMOUNT=1.5 [TOKE
 
 selendra-explorer: ## Serve the block explorer at http://127.0.0.1:8080 (node must be running)
 	python3 -m http.server 8080 --bind 127.0.0.1 --directory explorer
+
+selendra-evm-demo: ## EVM walkthrough with ethers.js: deploy an ERC-20, call it, read events, send SEL
+	cd clients/evm-ethers && npm install --silent && npm run --silent demo
+
+selendra-evm-deploy: ## Deploy a contract from clients/evm-ethers/contracts: make selendra-evm-deploy [CONTRACT=SelendraToken] [ARGS='"Name" SYM 1000']
+	cd clients/evm-ethers && npm install --silent && npm run --silent deploy -- $(or $(CONTRACT),SelendraToken) $(ARGS)
+
+selendra-evm-watch: ## Stream new blocks (and Transfer events of TOKEN=0x...) over WebSocket
+	cd clients/evm-ethers && npm install --silent && npm run --silent watch -- $(TOKEN)
+
+selendra-evm-compat: ## EVM compatibility suite: RPC methods, tx types, opcodes, precompiles, contracts, errors, logs, limits
+	cd clients/evm-ethers && npm install --silent && npm run --silent compat

@@ -238,6 +238,9 @@ most of the SEL. Set `PRIVATE_KEY=<hex>` to sign with another key. To make any o
 
 ### 5.4 MetaMask / EVM tools
 
+> **Full EVM guide:** [EVM.md](EVM.md) covers ethers.js, viem, Hardhat, Foundry, the supported RPC methods and the
+> differences from Ethereum. To run a ready-made ethers.js example: `make selendra-evm-demo`.
+
 Add a network in MetaMask:
 
 | Field | Value |
@@ -289,6 +292,7 @@ selendra/
 ├── explorer/                      # BLOCK EXPLORER — one static page (index.html), served by `make selendra-explorer`
 ├── clients/                       # APPS THAT TALK TO THE CHAIN
 │   ├── starter-js/                #   TypeScript client used by `make selendra-tx`
+│   ├── evm-ethers/                #   ethers.js + Solidity (compile, deploy, call, events) — see docs/EVM.md
 │   ├── metamask/  privy/          #   web wallet examples
 ├── testing/                       # TESTING
 │   ├── test-data/                 #   dev keys + sample requests
@@ -334,6 +338,9 @@ don't need SEL to send transactions. To make users pay their own gas, set `"paym
 | `make selendra-value` | Read value-setter state |
 | `make selendra-transfer TO=0x… AMOUNT=1.5` | Send SEL (or `TOKEN=token_…`) from the dev admin account |
 | `make selendra-explorer` | Block explorer on http://127.0.0.1:8080 |
+| `make selendra-evm-demo` | ethers.js walkthrough: deploy an ERC-20, call it, read events |
+| `make selendra-evm-deploy [CONTRACT=…] [ARGS=…]` | Deploy a contract from `clients/evm-ethers/contracts/` |
+| `make selendra-evm-watch [TOKEN=0x…]` | Live blocks and Transfer events over WebSocket |
 | `make clean-db` | Wipe all chain data (back to genesis) |
 | `make start-obs` / `make stop-obs` | Grafana (`:3000`, admin/admin123) + InfluxDB metrics stack |
 | `cargo test` | Run the rollup's integration tests |
