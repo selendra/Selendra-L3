@@ -1,0 +1,22 @@
+# OS / editor files
+.DS_Store
+Thumbs.db
+desktop.ini
+*:Zone.Identifier
+.idea/
+.vscode/
+*.swp
+*~
+
+# Local secrets and environment (commit *.env.example instead)
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+
+# Claude Code local settings
+.claude/settings.local.json
+selendra/chain/provers/sp1/guest-celestia/elf/rollup
+selendra/chain/provers/sp1/guest-mock/elf/mock_da
