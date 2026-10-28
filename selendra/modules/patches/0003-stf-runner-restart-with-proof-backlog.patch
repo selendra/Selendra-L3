@@ -1,0 +1,31 @@
+--- a/src/processes/stf_info_manager.rs
++++ b/src/processes/stf_info_manager.rs
+@@ -120,14 +120,20 @@
+                 let outstanding = write_rollup_height
+                     .get()
+                     .saturating_sub(next_rollup_height_to_receive);
+-                assert!(
+-                    outstanding <= self.max_nb_of_infos_in_db.get(),
+-                    "Too many STF infos in the db: {}, vs max allowed {} last_submitted={} write={}",
+-                    outstanding,
+-                    self.max_nb_of_infos_in_db,
+-                    next_rollup_height_to_receive,
+-                    write_rollup_height,
+-                );
++                // Selendra: warn instead of panicking. More entries than `max_nb_of_infos_in_db` are left when the
++                // chain stops accepting this node's proofs (e.g. its prover bond ran out): `prune_entries` never
++                // deletes unproven entries, it only warns while running. They are all still here, so the prover
++                // can resume from the last accepted proof once it is bonded again; panicking made restart impossible.
++                if outstanding > self.max_nb_of_infos_in_db.get() {
++                    tracing::warn!(
++                        outstanding,
++                        max_allowed = %self.max_nb_of_infos_in_db,
++                        last_submitted = next_rollup_height_to_receive,
++                        write = %write_rollup_height,
++                        "More STF infos in the db than allowed: proofs since the last accepted one were not accepted \
++                         on-chain. Check that the prover is bonded; the db keeps growing until proofs are accepted."
++                    );
++                }
+             }
+             // Db is empty
+             None => {

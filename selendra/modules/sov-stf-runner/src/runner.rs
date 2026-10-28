@@ -1,0 +1,933 @@
+use std::net::SocketAddr;
+use std::sync::atomic::AtomicU64;
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::Context;
+use jsonrpsee::RpcModule;
+use sov_db::ledger_db::{LedgerDb, SlotCommit};
+use sov_db::schema::{DeltaReader, SchemaBatch};
+use sov_full_node_configs::runner::{CorsConfiguration, ProofManagerConfig, RunnerConfig};
+use sov_metrics::RunnerMetrics;
+
+use sov_rollup_full_node_interface::DaSyncState;
+use sov_rollup_full_node_interface::{StateChannel, StateUpdateInfo};
+use sov_rollup_interface::common::{RollupHeight, SlotNumber};
+use sov_rollup_interface::da::{BlobReaderTrait, BlockHeaderTrait, DaSpec};
+use sov_rollup_interface::node::da::{DaService, SlotData};
+use sov_rollup_interface::node::ledger_api::LedgerStateProvider;
+use sov_rollup_interface::node::SyncStatus;
+use sov_rollup_interface::stf::{
+    ExecutionContext, PartialProofReceipt, ProofOutcome, ProofReceipt, ProofReceiptContents,
+    StateTransitionFunction,
+};
+use sov_rollup_interface::storage::HierarchicalStorageManager;
+use sov_rollup_interface::zk::StateTransitionWitness;
+use sov_rollup_interface::ProvableHeightTracker;
+use sov_shutdown::{
+    BackgroundHandle, FutureOrShutdownOutput, PrimaryShutdownController, RunnerShutdownController,
+};
+use tracing::{debug, info, trace};
+
+use crate::da::{DaServiceWithCachedFinalizedHeaders, FinalizedBlocksBulkFetcher};
+use crate::http::HttpServerStart;
+use crate::processes::{new_stf_info_channel, Receiver};
+use crate::state_manager::{AggregatedProofs, BlockCandidateResolution, StateManager};
+use tokio::net::TcpListener;
+
+type GenesisParams<ST, Da> = <ST as StateTransitionFunction<Da>>::GenesisParams;
+
+type NextDaHeightToProcess = u64;
+
+fn validate_proof_manager_config<Address>(
+    config: &ProofManagerConfig<Address>,
+) -> anyhow::Result<()> {
+    let aggregated_proof_block_jump = u64::try_from(config.aggregated_proof_block_jump.get())
+        .context("aggregated_proof_block_jump does not fit in u64")?;
+    let buffered_windows = u64::try_from(config.max_number_of_aggregated_proofs_in_memory.get())
+        .context("max_number_of_aggregated_proofs_in_memory does not fit in u64")?;
+    // Windows resident across the pipeline: the one intake is filling, the one
+    // the aggregator is working on, plus `buffered_windows` queued in the
+    // intake→aggregator channel.
+    let pipelined_windows = buffered_windows
+        .checked_add(2)
+        .context("aggregated proof window count overflowed")?;
+    let pipelined_backlog = aggregated_proof_block_jump
+        .checked_mul(pipelined_windows)
+        .context("aggregated proof backlog overflowed")?;
+    let required_transitions_in_db = config
+        .max_number_of_transitions_in_memory
+        .get()
+        .checked_add(pipelined_backlog)
+        .context("required STF info DB capacity overflowed")?;
+
+    anyhow::ensure!(
+        config.max_number_of_transitions_in_db.get() >= required_transitions_in_db,
+        "Invalid proof manager config: `max_number_of_transitions_in_db` must be at least `max_number_of_transitions_in_memory + (max_number_of_aggregated_proofs_in_memory + 2) * aggregated_proof_block_jump` for pipelined aggregated proof posting (got db={}, memory={}, jump={}, buffered={}, required={})",
+        config.max_number_of_transitions_in_db,
+        config.max_number_of_transitions_in_memory,
+        config.aggregated_proof_block_jump,
+        config.max_number_of_aggregated_proofs_in_memory,
+        required_transitions_in_db,
+    );
+
+    Ok(())
+}
+
+/// Combines `DaService` with `StateTransitionFunction` and "runs" the rollup.
+#[allow(clippy::type_complexity)]
+pub struct StateTransitionRunner<Stf, Sm, Da>
+where
+    Da: DaService,
+    Sm: HierarchicalStorageManager<Da::Spec>,
+    Sm::StfState: Clone,
+    Stf: StateTransitionFunction<Da::Spec>,
+{
+    first_unprocessed_height_at_startup: u64,
+    da_polling_interval: Duration,
+    da_service: Arc<Da>,
+    stf: Stf,
+    state_manager: StateManager<Stf::StateRoot, Stf::Witness, Sm, Da>,
+    stf_info_receiver: Option<Receiver<Stf::StateRoot, Stf::Witness, Da::Spec>>,
+    sync_state: Arc<DaSyncState>,
+    sync_fetcher: FinalizedBlocksBulkFetcher<Da>,
+    primary_shutdown: PrimaryShutdownController,
+    runner_shutdown: RunnerShutdownController,
+    background_handles: Vec<BackgroundHandle<anyhow::Result<()>>>,
+    start_at_rollup_height: Option<RollupHeight>,
+    stop_at_rollup_height: Option<RollupHeight>,
+    save_tx_bodies: bool,
+    finalized_headers_provider: DaServiceWithCachedFinalizedHeaders<Da>,
+    axum_tcp: Option<TcpListener>,
+}
+
+// Guarantees the runner's background tasks are signalled to stop whenever the runner is dropped.
+impl<Stf, Sm, Da> Drop for StateTransitionRunner<Stf, Sm, Da>
+where
+    Da: DaService,
+    Sm: HierarchicalStorageManager<Da::Spec>,
+    Sm::StfState: Clone,
+    Stf: StateTransitionFunction<Da::Spec>,
+{
+    fn drop(&mut self) {
+        self.runner_shutdown.shutdown();
+    }
+}
+
+/// Initializes rollup genesis.
+/// Gets proper DA block and finalizes storage.
+/// Returns root hashes.
+pub async fn initialize_state<Stf, Da, Sm>(
+    stf: &Stf,
+    storage_manager: &mut Sm,
+    genesis_block: Da::FilteredBlock,
+    genesis_params: GenesisParams<Stf, Da::Spec>,
+) -> anyhow::Result<Stf::StateRoot>
+where
+    Stf: StateTransitionFunction<Da::Spec>,
+    Da: DaService,
+    Sm: HierarchicalStorageManager<
+        Da::Spec,
+        LedgerChangeSet = SchemaBatch,
+        LedgerState = DeltaReader,
+        StfState = Stf::PreState,
+        StfChangeSet = Stf::ChangeSet,
+    >,
+{
+    let block_header = genesis_block.header().clone();
+    info!(
+        header = %block_header.display(),
+        "No history detected. Initializing chain on the block header..."
+    );
+    let (stf_state, ledger_state) = storage_manager.create_state_for(&block_header)?;
+    let ledger_db = LedgerDb::with_reader(ledger_state)?;
+
+    let (genesis_state_root, initialized_storage) =
+        stf.init_chain(&block_header, stf_state, genesis_params);
+
+    let data_to_commit: SlotCommit<_, Stf::BatchReceiptContents, Stf::TxReceiptContents> =
+        SlotCommit::new(genesis_block, Vec::default());
+    let mut ledger_change_set =
+        ledger_db.materialize_slot(data_to_commit, genesis_state_root.as_ref())?;
+
+    let finalized_slot_changes =
+        ledger_db.materialize_latest_finalize_slot(SlotNumber::GENESIS, SlotNumber::GENESIS)?;
+
+    ledger_change_set.merge(finalized_slot_changes);
+    storage_manager.save_change_set(&block_header, initialized_storage, ledger_change_set)?;
+    storage_manager.finalize(&block_header)?;
+
+    Ok(genesis_state_root)
+}
+
+impl<Stf, Sm, Da> StateTransitionRunner<Stf, Sm, Da>
+where
+    Da: DaService<Error = anyhow::Error>,
+    Sm: HierarchicalStorageManager<
+        Da::Spec,
+        LedgerChangeSet = SchemaBatch,
+        LedgerState = DeltaReader,
+    >,
+    Sm::StfState: Clone,
+    Stf: StateTransitionFunction<Da::Spec, PreState = Sm::StfState, ChangeSet = Sm::StfChangeSet>,
+{
+    /// Creates a new [`StateTransitionRunner`].
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    pub async fn new(
+        runner_config: RunnerConfig,
+        axum_tcp: TcpListener,
+        pm_config: Option<ProofManagerConfig<Stf::Address>>,
+        da_service: Arc<Da>,
+        ledger_db: LedgerDb,
+        stf: Stf,
+        storage_manager: Sm,
+        state_channel: StateChannel<Sm::StfState>,
+        prev_state_root: Stf::StateRoot,
+        state_height_tracker: Box<dyn ProvableHeightTracker>,
+        primary_shutdown: PrimaryShutdownController,
+        start_at_rollup_height: Option<RollupHeight>,
+        stop_at_rollup_height: Option<RollupHeight>,
+        sync_state: Arc<DaSyncState>,
+        da_service_with_cached_finalized_headers: DaServiceWithCachedFinalizedHeaders<Da>,
+        genesis_da_height: u64,
+        latest_proof_final_slot: Option<SlotNumber>,
+    ) -> anyhow::Result<Self> {
+        error_if_tokio_runtime_is_not_multi_threaded()?;
+        tracing::info!(config = ?runner_config, "Initializing StateTransitionRunner");
+        let mut background_handles = Vec::new();
+
+        // Controls shutdown of the runner's own background tasks. It is not
+        // signalled immediately; background tasks subscribe to it as they are
+        // spawned (fetcher here, REST/RPC handlers and the sync-status updater
+        // later) and stop once `shutdown` is sent.
+        let runner_shutdown = RunnerShutdownController::new();
+
+        let first_unprocessed_height_at_startup = sync_state
+            .synced_da_height
+            .load(std::sync::atomic::Ordering::Acquire)
+            .checked_add(1)
+            .expect("The impossible happened  first_unprocessed_height_at_startup overflowed");
+
+        // During startup last processed header is always the finalized one,
+        // because runner does not save to disk non-finalized headers.
+        let last_processed_da_header = da_service
+            .get_block_header_at(first_unprocessed_height_at_startup.saturating_sub(1))
+            .await?;
+
+        debug!(
+            last_processed_da_header = %last_processed_da_header.display(),
+            %first_unprocessed_height_at_startup,
+            proof_manager_config = ?pm_config,
+            "Initializing StfRunner");
+
+        let (stf_info_sender, stf_info_receiver) = if let Some(config) = pm_config {
+            validate_proof_manager_config(&config)?;
+            let channel = new_stf_info_channel(
+                ledger_db.clone(),
+                config.max_number_of_transitions_in_memory,
+                config.max_number_of_transitions_in_db,
+                latest_proof_final_slot,
+            )
+            .await?;
+
+            (Some(channel.0), Some(channel.1))
+        } else {
+            (None, None)
+        };
+
+        let da_polling_interval = Duration::from_millis(runner_config.da_polling_interval_ms);
+
+        let state_manager = StateManager::new(
+            storage_manager,
+            ledger_db,
+            prev_state_root,
+            state_channel,
+            stf_info_sender,
+            state_height_tracker,
+            sync_state.clone(),
+            da_service_with_cached_finalized_headers.clone(),
+            genesis_da_height,
+            last_processed_da_header,
+        );
+
+        let (sync_fetcher, fetcher_background_handle) = FinalizedBlocksBulkFetcher::new(
+            da_service.clone(),
+            first_unprocessed_height_at_startup,
+            runner_config.concurrent_sync_tasks,
+            runner_config.pre_fetched_blocks_capacity.get(),
+            runner_shutdown.clone(),
+        )
+        .await?;
+        background_handles.push(fetcher_background_handle);
+
+        Ok(Self {
+            first_unprocessed_height_at_startup,
+            da_polling_interval,
+            da_service: da_service.clone(),
+            stf,
+            state_manager,
+            sync_state,
+            stf_info_receiver,
+            sync_fetcher,
+            primary_shutdown,
+            runner_shutdown,
+            background_handles,
+            start_at_rollup_height,
+            stop_at_rollup_height,
+            save_tx_bodies: runner_config.save_tx_bodies,
+            finalized_headers_provider: da_service_with_cached_finalized_headers,
+            axum_tcp: Some(axum_tcp),
+        })
+    }
+
+    /// Returns the socket address of the Axum server.
+    ///
+    /// This method must be called before [`StateTransitionRunner::run_in_process`], as the TCP listener
+    /// is consumed when the HTTP server starts. Calling this method after `run_in_process` will return
+    /// an error.
+    pub fn axum_socket_address(&self) -> anyhow::Result<SocketAddr> {
+        let axum_tcp = self
+            .axum_tcp
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("The axum tcp listener is not initialized."))?;
+        Ok(axum_tcp.local_addr()?)
+    }
+
+    /// Subscribes to this runner's [`StateUpdateInfo`] channel, if enabled.
+    ///
+    /// Only one [`Receiver`] is allowed, and subsequent calls to this method
+    /// will return [`None`].
+    pub fn take_stf_info_receiver(
+        &mut self,
+    ) -> Option<Receiver<Stf::StateRoot, Stf::Witness, Da::Spec>> {
+        self.stf_info_receiver.take()
+    }
+
+    /// Returns the [`DaSyncState`] of the node.
+    pub fn da_sync_state(&self) -> Arc<DaSyncState> {
+        self.sync_state.clone()
+    }
+
+    /// Starts an HTTP server with the provided router.
+    pub async fn start_http_server(
+        &mut self,
+        router: axum::Router<()>,
+        methods: RpcModule<()>,
+        cors_configuration: CorsConfiguration,
+        rpc_aggregation: sov_metrics::RpcAggregationConfig,
+    ) -> anyhow::Result<()> {
+        let HttpServerStart {
+            http_server_handle,
+            rpc_metrics_flush_handle,
+        } = crate::http::start_http_server(
+            self.axum_tcp
+                .take()
+                .ok_or_else(|| anyhow::anyhow!("HTTP server already started."))?,
+            router,
+            methods,
+            self.runner_shutdown.clone(),
+            cors_configuration,
+            rpc_aggregation,
+        )
+        .await?;
+
+        self.background_handles.push(http_server_handle);
+        self.background_handles.push(rpc_metrics_flush_handle);
+
+        Ok(())
+    }
+
+    /// Shuts down any background work spawned during initialization before the
+    /// runner enters its main loop.
+    pub async fn shutdown_before_run(mut self) -> anyhow::Result<()> {
+        self.runner_shutdown.shutdown();
+
+        // Drain concurrently.
+        let background_handles = std::mem::take(&mut self.background_handles);
+        futures::future::join_all(background_handles).await;
+
+        Ok(())
+    }
+
+    /// Spawn a [`tokio::task`] that updates the sync status every `polling_interval`.
+    fn spawn_sync_status_updater(
+        &self,
+        polling_interval: Duration,
+        shutdown: RunnerShutdownController,
+    ) -> tokio::task::JoinHandle<()> {
+        let sync_state = self.sync_state.clone();
+        let da_service_with_cache = self.finalized_headers_provider.clone();
+        let stop_at_rollup_height = self.stop_at_rollup_height;
+
+        tokio::task::spawn(async move {
+            let mut interval = tokio::time::interval(polling_interval);
+            debug!(
+                interval_ms = interval.period().as_millis(),
+                "Interval for polling sync DA height"
+            );
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            interval.tick().await; // Tick the interval once because it starts at 0ms.
+
+            loop {
+                match shutdown
+                    .future_or_shutdown(get_target_block(
+                        &da_service_with_cache,
+                        &stop_at_rollup_height,
+                    ))
+                    .await
+                {
+                    FutureOrShutdownOutput::Shutdown => break,
+                    FutureOrShutdownOutput::Output(Err(error)) => {
+                        tracing::info!(
+                            ?error,
+                            "Received error getting head block header, continue to next tick..."
+                        );
+                        continue;
+                    }
+                    FutureOrShutdownOutput::Output(Ok(header)) => {
+                        let target_da_height = header.height();
+                        if let Err(error) = sync_state.update_target(target_da_height) {
+                            tracing::warn!(
+                                target_da_height,
+                                ?error,
+                                "Received error updating target height, stopping background task"
+                            );
+                            break;
+                        };
+                        if let SyncStatus::Syncing {
+                            synced_da_height,
+                            target_da_height,
+                        } = sync_state.status()
+                        {
+                            match target_da_height.checked_sub(synced_da_height) {
+                                None => {
+                                    trace!(
+                                        target_da_height,
+                                        synced_da_height,
+                                        "Reorg happened, switch is in progress"
+                                    );
+                                }
+                                Some(distance) => {
+                                    if distance > 1 {
+                                        info!(
+                                            synced_da_height,
+                                            target_da_height, "Sync in progress"
+                                        );
+                                    } else {
+                                        trace!(
+                                            synced_da_height,
+                                            target_da_height,
+                                            "Sync in progress"
+                                        );
+                                    }
+                                }
+                            };
+                        }
+                        shutdown.future_or_shutdown(interval.tick()).await;
+                    }
+                }
+            }
+        })
+    }
+
+    /// Runs the rollup.
+    pub async fn run_in_process(&mut self) -> anyhow::Result<()> {
+        self.state_manager.startup().await?;
+
+        let mut next_da_height = self.first_unprocessed_height_at_startup;
+
+        let status_updater_handle =
+            self.spawn_sync_status_updater(self.da_polling_interval, self.runner_shutdown.clone());
+
+        let start_at_rollup_height = self.start_at_rollup_height;
+        let stop_at_rollup_height = self.stop_at_rollup_height;
+        let primary_shutdown = self.primary_shutdown.clone();
+        loop {
+            if self.stop_at_rollup_height.is_some() {
+                // Rollup is performing an upgrade procedure. We wait until the next_da_height is finalized.
+                let is_shutting_down = Self::wait_until_next_da_height_finalized_or_shutdown(
+                    self,
+                    next_da_height,
+                    &primary_shutdown,
+                )
+                .await?;
+
+                if is_shutting_down {
+                    break;
+                }
+            }
+            match primary_shutdown
+                .future_or_shutdown(self.process_next_slot(
+                    next_da_height,
+                    &start_at_rollup_height,
+                    &stop_at_rollup_height,
+                ))
+                .await
+            {
+                FutureOrShutdownOutput::Shutdown => break,
+                FutureOrShutdownOutput::Output(slot_result) => match slot_result? {
+                    Some(next) => next_da_height = next,
+                    None => {
+                        break;
+                    }
+                },
+            }
+        }
+
+        self.stop_runner(status_updater_handle).await
+    }
+
+    /// Signals the runner's background tasks to stop and waits for them to
+    /// finish.
+    ///
+    /// Sends the runner shutdown notification, then joins the sync-status
+    /// updater followed by all other tracked background handles (HTTP server,
+    /// finalized-block fetcher, etc.).
+    async fn stop_runner(
+        &mut self,
+        status_updater_handle: tokio::task::JoinHandle<()>,
+    ) -> anyhow::Result<()> {
+        info!("Runner main loop is completed, keep shutting down...");
+        self.runner_shutdown.shutdown();
+        info!("Runner shutdown sent, waiting for status updater to stop...");
+        status_updater_handle
+            .await
+            .context("Status update handler")?;
+
+        let background_handles = std::mem::take(&mut self.background_handles);
+        for handle in background_handles {
+            let _ = handle.await?;
+        }
+
+        Ok(())
+    }
+
+    async fn wait_until_next_da_height_finalized_or_shutdown(
+        &self,
+        next_da_height: u64,
+        primary_shutdown: &PrimaryShutdownController,
+    ) -> anyhow::Result<bool> {
+        loop {
+            let finalized_height = self
+                .finalized_headers_provider
+                .get_last_finalized_block_header()?
+                .height();
+            if next_da_height > finalized_height {
+                info!(%finalized_height, %next_da_height, "Waiting until next DA height is finalized");
+                match primary_shutdown
+                    .future_or_shutdown(tokio::time::sleep(self.da_polling_interval))
+                    .await
+                {
+                    FutureOrShutdownOutput::Shutdown => return Ok(true),
+                    FutureOrShutdownOutput::Output(()) => continue,
+                }
+            } else {
+                break;
+            }
+        }
+
+        Ok(false)
+    }
+
+    async fn process_next_slot(
+        &mut self,
+        next_da_height: NextDaHeightToProcess,
+        start_at_rollup_height: &Option<RollupHeight>,
+        stop_at_rollup_height: &Option<RollupHeight>,
+    ) -> anyhow::Result<Option<NextDaHeightToProcess>> {
+        let loop_start = std::time::Instant::now();
+        let span = tracing::info_span!("process_next_slot", next_da_height = next_da_height);
+
+        if let Some(h) = start_at_rollup_height {
+            span.record("start_at_rollup_height", tracing::field::display(h));
+        }
+        if let Some(h) = stop_at_rollup_height {
+            span.record("stop_at_rollup_height", tracing::field::display(h));
+        }
+        debug!("Requesting DA block");
+
+        let mut transaction_count = 0;
+        let mut batch_count = 0;
+        let get_block_start = std::time::Instant::now();
+        let filtered_block = if next_da_height <= self.sync_fetcher.last_finalized_height {
+            // no reorg will happen for this height; it is safe to just pull it from the fetcher,
+            // which could have this block fetched already
+            let block = self.sync_fetcher.get_block_at(next_da_height).await?;
+            // Pre-populate the finalized headers cache with this header to avoid
+            // a redundant network call in get_effective_finalized_header
+            self.finalized_headers_provider
+                .insert_header(block.header().clone());
+            block
+        } else {
+            // Requests height might re-org
+            // It never returns a future height for requested
+            crate::da::fetch_block_reorg_aware(
+                self.da_service.as_ref(),
+                self.sync_state.as_ref(),
+                next_da_height,
+            )
+            .await?
+        };
+        let get_block_time = get_block_start.elapsed();
+        assert!(
+            filtered_block.header().height() <= next_da_height,
+            "Bug in block fetching results, it returned future block"
+        );
+        tracing::trace!(time = ?get_block_time, header = %filtered_block.header().display(), "DA block has been fetched, checking continuation");
+
+        // Check if this block is a valid continuation of the current chain.
+        // If not, early return with the height runner should fetch next.
+        let (stf_pre_state, pre_state_root, ledger_pre_state) = match self
+            .state_manager
+            .check_continuation(filtered_block.header(), &self.da_service)
+            .await
+            .map_err(|e| {
+                tracing::warn!(?e, "Error during is_good_continuation");
+                e
+            })? {
+            BlockCandidateResolution::KnownContinuation {
+                pre_state,
+                pre_state_root,
+                ledger_pre_state,
+            } => {
+                tracing::trace!(
+                    header = %filtered_block.header().display(),
+                    "Block is a valid continuation, proceeding with STF execution"
+                );
+                (pre_state, pre_state_root, ledger_pre_state)
+            }
+            BlockCandidateResolution::NoMatch { height_to_fetch } => {
+                debug!(
+                    requested_height = next_da_height,
+                    height_to_fetch,
+                    "Block is not a continuation, runner should fetch different height"
+                );
+                // Early return - runner's main loop will fetch the new height
+                return Ok(Some(height_to_fetch));
+            }
+        };
+
+        let filtered_block_header = filtered_block.header().clone();
+
+        // STF execution
+        let stf_execution_start = std::time::Instant::now();
+        let mut relevant_blobs = self.da_service.extract_relevant_blobs(&filtered_block);
+        let batch_blobs = &mut relevant_blobs.batch_blobs;
+        let proof_blobs = &relevant_blobs.proof_blobs;
+        debug!(
+            batch_blobs_count = batch_blobs.len(),
+            next_da_height,
+            current_state_root = hex::encode(pre_state_root.as_ref()),
+            batch_blobs = ?batch_blobs
+                .iter()
+                .map(|b| format!(
+                    "sequencer={} blob_hash=0x{}",
+                    b.sender(),
+                    hex::encode(b.hash())
+                ))
+                .collect::<Vec<_>>(),
+            proof_blobs = ?proof_blobs
+                .iter()
+                .map(|b| format!(
+                    "sequencer={} blob_hash=0x{}, len={}",
+                    b.sender(),
+                    hex::encode(b.hash()),
+                    b.total_len()
+                ))
+                .collect::<Vec<_>>(),
+            "Extracted relevant blobs"
+        );
+        let da_extraction_time = stf_execution_start.elapsed();
+
+        let apply_slot_start = std::time::Instant::now();
+        // `apply_slot` is a CPU-bound, synchronous computation. Run it via
+        // `block_in_place` so the tokio worker hands off its scheduler core to
+        // another thread instead of stalling the async runtime while we execute
+        // the slot.
+        let slot_result = tokio::task::block_in_place(|| {
+            self.stf.apply_slot(
+                &pre_state_root,
+                stf_pre_state,
+                Default::default(),
+                &filtered_block_header,
+                relevant_blobs.as_iters(),
+                ExecutionContext::Node,
+            )
+        });
+
+        let apply_slot_time = apply_slot_start.elapsed();
+
+        // --- Before destructuring the receipt, extract some data for metrics ---
+        let batch_bytes_processed: u64 = relevant_blobs
+            .batch_blobs
+            .iter()
+            .map(|b| b.verified_data().len() as u64)
+            .sum();
+        let proof_bytes_processed: u64 = relevant_blobs
+            .proof_blobs
+            .iter()
+            .map(|b| b.verified_data().len() as u64)
+            .sum();
+        let proof_blobs_processed = slot_result.proof_receipts.len();
+        tracing::trace!(
+            ?apply_slot_time,
+            batch_receipts = slot_result.batch_receipts.len(),
+            %batch_bytes_processed,
+            proof_receipts = proof_blobs_processed,
+            "Apply slot completed"
+        );
+        // --- End metric extraction ---
+
+        let get_relevant_proofs_start = std::time::Instant::now();
+        // Get merkle proofs for the relevant blobs
+        let relevant_proofs = self
+            .da_service
+            .get_extraction_proof(&filtered_block, &relevant_blobs)
+            .await;
+        let get_relevant_proofs_time = get_relevant_proofs_start.elapsed();
+        // Handling executed data
+        let mut data_to_commit = SlotCommit::new(filtered_block, slot_result.discarded_blobs);
+        for mut receipt in slot_result.batch_receipts {
+            if !self.save_tx_bodies {
+                for tx in receipt.tx_receipts.iter_mut() {
+                    tx.body_to_save = None;
+                }
+            }
+            batch_count += 1;
+            transaction_count += receipt.tx_receipts.len();
+            data_to_commit.add_batch(receipt);
+        }
+
+        let transition_data: StateTransitionWitness<Stf::StateRoot, Stf::Witness, Da::Spec> =
+            StateTransitionWitness {
+                initial_state_root: pre_state_root,
+                final_state_root: slot_result.state_root.clone(),
+                da_block_header: filtered_block_header.clone(),
+                relevant_proofs,
+                relevant_blobs,
+                witness: slot_result.witness,
+                slot_number: slot_result.slot_number,
+            };
+
+        let (aggregated_proofs, proof_receipts) =
+            Self::collect_aggregated_proofs_and_receipts(slot_result.proof_receipts.into_iter());
+
+        let processing_changes_start = std::time::Instant::now();
+        self.state_manager
+            .process_stf_changes(
+                slot_result.change_set,
+                ledger_pre_state,
+                transition_data,
+                data_to_commit,
+                aggregated_proofs,
+                proof_receipts,
+            )
+            .await?;
+        trace!("Stf changes processing is completed");
+
+        // Updating counters and metrics
+        self.sync_state.update_synced(next_da_height);
+        debug!(
+            time = ?loop_start.elapsed(),
+            "Block execution complete"
+        );
+        // New influxdb metrics
+        sov_metrics::track_metrics(|metrics| {
+            let synced_da_height = self
+                .sync_state
+                .synced_da_height
+                .load(std::sync::atomic::Ordering::Acquire);
+            let target_da_height = self
+                .sync_state
+                .target_da_height
+                .load(std::sync::atomic::Ordering::Acquire);
+            let point = RunnerMetrics {
+                sync_distance: target_da_height as i64 - synced_da_height as i64,
+                da_height: next_da_height,
+                rollup_height: slot_result.rollup_height.get(),
+                start_at_rollup_height: start_at_rollup_height.as_ref().map(|h| h.get()),
+                stop_at_rollup_height: stop_at_rollup_height.as_ref().map(|h| h.get()),
+                get_block_time,
+                batches_processed: batch_count,
+                batch_bytes_processed,
+                proofs_processed: proof_blobs_processed as u64,
+                proof_bytes_processed,
+                transactions_processed: transaction_count as u64,
+                process_slot_time: loop_start.elapsed(),
+                apply_slot_time,
+                stf_transition_time: stf_execution_start.elapsed(),
+                extract_blobs_time: da_extraction_time,
+                extraction_proof_time: get_relevant_proofs_time,
+                processing_changes_time: processing_changes_start.elapsed(),
+            };
+            metrics.track_runner_metrics(point);
+        });
+
+        // If the rollup is upgrading and the current height has reached the stop point,
+        // halt further slot processing.
+        if let Some(stop_at_rollup_height) = stop_at_rollup_height {
+            if &slot_result.rollup_height == stop_at_rollup_height {
+                info!(rollup_height = %stop_at_rollup_height, "Stopping at rollup the height");
+                return Ok(None);
+            }
+            assert!(
+                &slot_result.rollup_height < stop_at_rollup_height,
+                "The rollup height ({}) must be less than the stop height ({})",
+                slot_result.rollup_height,
+                stop_at_rollup_height
+            );
+        }
+
+        Ok(Some(next_da_height + 1))
+    }
+
+    /// Retrieve a handle for the underlying DA service
+    pub fn da_service(&self) -> Arc<Da> {
+        self.da_service.clone()
+    }
+
+    #[allow(clippy::type_complexity)] // Any type alias needs the STF bounds, which are more complex than the original type
+    fn collect_aggregated_proofs_and_receipts(
+        receipts: impl Iterator<
+            Item = ProofReceipt<Stf::Address, Da::Spec, Stf::StateRoot, Stf::StorageProof>,
+        >,
+    ) -> (
+        AggregatedProofs,
+        Vec<PartialProofReceipt<Stf::Address, Da::Spec, Stf::StateRoot, Stf::StorageProof>>,
+    ) {
+        let mut aggregated_proofs = AggregatedProofs::default();
+        #[allow(clippy::type_complexity)]
+        // Any type alias needs the STF bounds, which are more complex than the original type
+        let mut partial_receipts: Vec<
+            PartialProofReceipt<Stf::Address, Da::Spec, Stf::StateRoot, Stf::StorageProof>,
+        > = Vec::new();
+        for mut receipt in receipts {
+            match &mut receipt.outcome {
+                ProofOutcome::Valid(ProofReceiptContents::AggregateProof(
+                    _public_data,
+                    raw_proof,
+                )) => {
+                    let raw_proof = std::mem::take(raw_proof);
+                    aggregated_proofs
+                        .all_aggregated_proofs
+                        .push(raw_proof.clone());
+                    aggregated_proofs.accepted_aggregated_proofs.push(raw_proof);
+                }
+                ProofOutcome::Valid(_) => {
+                    tracing::info!("Not aggregated proof, probably running in a different mode. Will be fixed in the future.");
+                }
+                ProofOutcome::Invalid(_, proof) => {
+                    if let Some(proof) = proof.take() {
+                        aggregated_proofs.all_aggregated_proofs.push(proof);
+                    }
+                    tracing::error!(
+                        outcome = ?receipt.outcome,
+                        blob_hash = hex::encode(receipt.blob_hash),
+                        "Invalid proof outcome");
+                }
+                ProofOutcome::Ignored => {
+                    tracing::error!(
+                        outcome = ?receipt.outcome,
+                        blob_hash = hex::encode(receipt.blob_hash),
+                        "Invalid proof outcome");
+                }
+            }
+            partial_receipts.push(receipt.into());
+        }
+
+        (aggregated_proofs, partial_receipts)
+    }
+}
+
+/// Creates a new [`StateUpdateInfo`] with some storage state and chain data
+/// queried from [`LedgerDb`].
+pub async fn query_state_update_info<S>(
+    ledger_db: &LedgerDb,
+    storage: S,
+    da_sync_state: &DaSyncState,
+) -> anyhow::Result<StateUpdateInfo<S>> {
+    let slot_number = ledger_db.get_head_slot_number().await?;
+    let next_event_number = ledger_db
+        .get_latest_event_number()
+        .await?
+        .map(|x| x + 1)
+        .unwrap_or_default();
+    let next_tx_number = ledger_db.get_next_items_numbers()?.tx_number;
+    let latest_finalized_slot_number = ledger_db
+        .get_latest_finalized_slot_number()
+        .await?
+        .min(slot_number);
+
+    Ok(StateUpdateInfo {
+        storage,
+        ledger_reader: ledger_db.clone_reader(),
+        next_event_number,
+        next_tx_number,
+        slot_number,
+        latest_finalized_slot_number,
+        sync_status: da_sync_state.status(),
+    })
+}
+
+fn error_if_tokio_runtime_is_not_multi_threaded() -> anyhow::Result<()> {
+    use tokio::runtime::{Handle, RuntimeFlavor};
+
+    match Handle::current().runtime_flavor() {
+            RuntimeFlavor::CurrentThread => Err(anyhow::anyhow!("A multi-threaded Tokio runtime is required to run the rollup node. Check your Tokio configuration. If you're testing node functionality, make sure your test uses `#[tokio::test(flavor = \"multi_thread\")]` or an equivalent configuration. Aborting.")),
+            _ => Ok(())
+        }
+}
+
+/// Creates a new `DaSyncState`
+pub async fn make_da_sync_state<Da: DaService<Error = anyhow::Error>>(
+    genesis_da_height: u64,
+    stop_at_rollup_height: Option<RollupHeight>,
+    ledger_db: &LedgerDb,
+    da_service_with_cache: &DaServiceWithCachedFinalizedHeaders<Da>,
+) -> anyhow::Result<Arc<DaSyncState>> {
+    let next_item_numbers = ledger_db.get_next_items_numbers()?;
+    let last_slot_processed_before_shutdown = next_item_numbers.slot_number.saturating_sub(1);
+
+    debug!(%last_slot_processed_before_shutdown);
+    let da_height_processed = genesis_da_height + last_slot_processed_before_shutdown.get();
+
+    let target_da_height = get_target_block(da_service_with_cache, &stop_at_rollup_height)
+        .await?
+        .height();
+
+    let initial_sync_status = SyncStatus::Syncing {
+        synced_da_height: da_height_processed,
+        target_da_height,
+    };
+
+    let (sync_status_sender, _sync_status_receiver) =
+        tokio::sync::watch::channel(initial_sync_status);
+
+    tracing::debug!(
+        da_height_processed,
+        genesis_da_height,
+        target_da_height,
+        ?stop_at_rollup_height,
+        ?initial_sync_status,
+        "Initializing new instance of DaSyncState"
+    );
+    let sync_state = Arc::new(DaSyncState {
+        synced_da_height: da_height_processed.into(),
+        target_da_height: AtomicU64::new(target_da_height),
+        sync_status_sender,
+    });
+
+    Ok(sync_state)
+}
+
+async fn get_target_block<Da: DaService<Error = anyhow::Error>>(
+    da_service: &DaServiceWithCachedFinalizedHeaders<Da>,
+    stop_at_rollup_height: &Option<RollupHeight>,
+) -> anyhow::Result<<Da::Spec as DaSpec>::BlockHeader> {
+    // If we've entered the upgrade procedure, the rollup processes only finalized blocks.
+    if stop_at_rollup_height.is_some() {
+        da_service.get_last_finalized_block_header()
+    } else {
+        da_service.get_head_block_header().await
+    }
+}

@@ -30,6 +30,10 @@ CRATES = {
         "crates/module-system/module-implementations/sov-evm",
         ["0002-evm-rpc-block-by-synthetic-hash.patch"],
     ),
+    "sov-stf-runner": (
+        "crates/full-node/sov-stf-runner",
+        ["0003-stf-runner-restart-with-proof-backlog.patch"],
+    ),
 }
 
 

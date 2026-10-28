@@ -1,0 +1,141 @@
+mod prover;
+mod state;
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use borsh::BorshSerialize;
+use prover::Prover;
+use serde::de::DeserializeOwned;
+use serde::Serialize;
+use sov_rollup_interface::da::DaSpec;
+use sov_rollup_interface::node::da::DaService;
+use sov_rollup_interface::zk::{Zkvm, ZkvmGuest};
+
+use super::{ProverService, ProverServiceError, Verifier};
+use crate::processes::{ProofAggregationStatus, ProofProcessingStatus, StateTransitionInfo};
+
+/// Prover service that generates proofs in parallel.
+pub struct ParallelProverService<Address, StateRoot, Witness, Da, InnerVm, OuterVm>
+where
+    Address: Serialize + DeserializeOwned,
+    StateRoot: Serialize + DeserializeOwned + Clone + AsRef<[u8]> + PartialEq + core::fmt::Debug,
+    Witness: Serialize + DeserializeOwned,
+    Da: DaService,
+    InnerVm: Zkvm,
+    OuterVm: Zkvm,
+{
+    inner_vm: InnerVm::Host,
+    outer_vm: OuterVm::OuterHost,
+
+    prover_state: Prover<Address, StateRoot, Witness, Da>,
+
+    verifier: Arc<Verifier<Da>>,
+}
+
+impl<Address, StateRoot, Witness, Da, InnerVm, OuterVm>
+    ParallelProverService<Address, StateRoot, Witness, Da, InnerVm, OuterVm>
+where
+    Address:
+        BorshSerialize + AsRef<[u8]> + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+    StateRoot: Serialize
+        + DeserializeOwned
+        + Clone
+        + AsRef<[u8]>
+        + PartialEq
+        + core::fmt::Debug
+        + Send
+        + Sync
+        + 'static,
+    Witness: Serialize + DeserializeOwned + Send + Sync + 'static,
+    Da: DaService,
+    InnerVm: Zkvm,
+    OuterVm: Zkvm,
+{
+    /// Creates a new prover.
+    pub fn new(
+        inner_vm: InnerVm::Host,
+        outer_vm: OuterVm::OuterHost,
+        da_verifier: Da::Verifier,
+        num_threads: usize,
+        prover_address: Address,
+    ) -> Self {
+        let verifier = Arc::new(Verifier { da_verifier });
+
+        Self {
+            inner_vm,
+            outer_vm,
+            prover_state: Prover::new(prover_address, num_threads),
+            verifier,
+        }
+    }
+
+    /// Creates a new prover.
+    pub fn new_with_default_workers(
+        inner_vm: InnerVm::Host,
+        outer_vm: OuterVm::OuterHost,
+        da_verifier: Da::Verifier,
+        prover_address: Address,
+        num_threads: usize,
+    ) -> Self {
+        Self::new(inner_vm, outer_vm, da_verifier, num_threads, prover_address)
+    }
+}
+
+#[async_trait]
+impl<Address, StateRoot, Witness, Da, InnerVm, OuterVm> ProverService
+    for ParallelProverService<Address, StateRoot, Witness, Da, InnerVm, OuterVm>
+where
+    Address:
+        BorshSerialize + AsRef<[u8]> + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+    StateRoot: BorshSerialize
+        + Serialize
+        + DeserializeOwned
+        + Clone
+        + AsRef<[u8]>
+        + PartialEq
+        + core::fmt::Debug
+        + Send
+        + Sync
+        + 'static,
+    Witness: Serialize + DeserializeOwned + Send + Sync + 'static,
+    Da: DaService,
+    InnerVm: Zkvm + 'static,
+    OuterVm: Zkvm + 'static,
+{
+    type StateRoot = StateRoot;
+
+    type Witness = Witness;
+
+    type DaService = Da;
+
+    type Verifier = <OuterVm::Guest as ZkvmGuest>::Verifier;
+
+    async fn prove(
+        &self,
+        state_transition_info: StateTransitionInfo<
+            Self::StateRoot,
+            Self::Witness,
+            <Self::DaService as DaService>::Spec,
+        >,
+    ) -> Result<
+        ProofProcessingStatus<Self::StateRoot, Self::Witness, <Self::DaService as DaService>::Spec>,
+        ProverServiceError,
+    > {
+        let inner_vm = self.inner_vm.clone();
+
+        self.prover_state.start_proving::<InnerVm>(
+            state_transition_info,
+            inner_vm,
+            self.verifier.clone(),
+        )
+    }
+
+    async fn create_aggregated_proof(
+        &self,
+        block_headers: &[<<Self::DaService as DaService>::Spec as DaSpec>::BlockHeader],
+    ) -> anyhow::Result<ProofAggregationStatus> {
+        self.prover_state
+            .create_aggregated_proof(self.outer_vm.clone(), block_headers)
+            .await
+    }
+}

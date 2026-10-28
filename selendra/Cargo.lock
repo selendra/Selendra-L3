@@ -11938,7 +11938,6 @@ dependencies = [
 [[package]]
 name = "sov-stf-runner"
 version = "0.3.0"
-source = "git+https://github.com/Sovereign-Labs/sovereign-sdk.git?rev=f1a2dc3980d102abe0d457692afc9f3bac6e51a5#f1a2dc3980d102abe0d457692afc9f3bac6e51a5"
 dependencies = [
  "anyhow",
  "async-trait",

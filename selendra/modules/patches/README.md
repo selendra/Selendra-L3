@@ -8,8 +8,9 @@ section of the root `Cargo.toml`.
 |---|---|---|
 | `sov-sequencer` (in `modules/sov-sequencer`) | `0001-skip-empty-batches-while-idle.patch` (this folder) | Don't post an empty batch to Celestia on every DA block |
 | `sov-evm` (in `modules/sov-evm`) | `0002-evm-rpc-block-by-synthetic-hash.patch` (this folder) | `eth_getBlockByHash` returned "block not found" for a just-sealed block |
+| `sov-stf-runner` (in `modules/sov-stf-runner`) | `0003-stf-runner-restart-with-proof-backlog.patch` (this folder) | A prover node whose proofs were not accepted on-chain could not restart |
 
-`modules/sov-sequencer/` and `modules/sov-evm/` are **generated** by `scripts/vendor_sdk_crates.py` (the crate list
+`modules/sov-sequencer/`, `modules/sov-evm/` and `modules/sov-stf-runner/` are **generated** by `scripts/vendor_sdk_crates.py` (the crate list
 and each crate's patches are in `CRATES` at the top of the script). Don't edit them by hand: edit, then regenerate
 the `.patch` (see below).
 
@@ -62,6 +63,29 @@ number, so the pending list was empty and the lookup failed.
 existing "Case 2"), which is the order `get_maybe_sealed_block` already uses.
 
 **Safety.** RPC-only code (`native` feature): no change to the STF, state roots or the ZK guests.
+
+## 0003 — restarting a prover node whose proofs were not accepted
+
+**Problem.** When the chain stops accepting a node's proofs (measured: the prover unbonded with
+`prover_incentives.exit`, or its bond ran out), the node keeps proving and its proofs are rejected. The proving data
+(STF infos) piles up past `max_number_of_transitions_in_db`, or is pruned after use. On restart the node resumes from
+the last *accepted* proof and panicked: `Too many STF infos in the db` (`src/processes/stf_info_manager.rs`), a missing
+STF info, or `Slot number discontinuity` in the aggregation circuit.
+
+**Fix, in two parts.**
+- This patch: the startup check on the number of stored STF infos warns instead of panicking (the running node only
+  warns about the same condition), so a node that still has all the data resumes the proof chain.
+- `chain/node` (not a patch): before proving starts, `create_prover_service` checks that every STF info from the last
+  accepted proof up to the head is stored. If one is missing the node cannot extend the proof chain, so the binary
+  logs `Cannot resume proving: …` and re-executes itself with proving disabled: the node (and its sequencer) keeps
+  running.
+
+**Not done on purpose.** Starting a fresh outer proof from the stored data gets the prover **slashed**
+(`IncorrectGenesisHash`, measured), so the node never does that on its own.
+
+**Recovering proving.** Make sure the prover is bonded (`npm run prover-bond -- register <amount>` in
+`clients/starter-js`), then resync the node from genesis with `SOV_PROVER_MODE=prove` (empty `storage.path`). Measured:
+proofs accepted again, no slashing.
 
 ## Updating after an SDK upgrade
 

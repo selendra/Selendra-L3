@@ -116,3 +116,4 @@ risc0-build = "2.1"
 [patch."https://github.com/Sovereign-Labs/sovereign-sdk.git"]
 sov-sequencer = { path = "modules/sov-sequencer" }
 sov-evm = { path = "modules/sov-evm" }
+sov-stf-runner = { path = "modules/sov-stf-runner" }

@@ -1,0 +1,275 @@
+use std::marker::PhantomData;
+use std::sync::{Arc, RwLock};
+
+use borsh::BorshSerialize;
+use serde::de::DeserializeOwned;
+use serde::Serialize;
+use sov_rollup_interface::da::{BlockHeaderTrait, DaSpec, DaVerifier};
+use sov_rollup_interface::node::da::DaService;
+use sov_rollup_interface::zk::aggregated_proof::{
+    BlockProof, OuterZkvmHost, SerializedAggregatedProof,
+};
+use sov_rollup_interface::zk::{
+    SerializedZkProof, StateTransitionPublicData, StateTransitionWitness,
+    StateTransitionWitnessWithAddress, Zkvm, ZkvmHost,
+};
+use tokio::sync::oneshot;
+use tracing::{error, info, trace};
+
+use super::state::{ProverState, ProverStatus};
+use super::{ProverServiceError, Verifier};
+use crate::processes::{ProofAggregationStatus, ProofProcessingStatus, StateTransitionInfo};
+
+// A prover that generates proofs in parallel using a thread pool. If the pool is saturated,
+// the prover will reject new jobs.
+pub(crate) struct Prover<Address, StateRoot, Witness, Da: DaService> {
+    prover_address: Address,
+    prover_state: Arc<RwLock<ProverState<Address, StateRoot, Da::Spec>>>,
+    num_threads: usize,
+    // From Docs:
+    // """
+    // When the ThreadPool is dropped,
+    // that's a signal for the threads it manages to terminate,
+    // they will complete executing any remaining work that you have spawned,
+    // and automatically terminate.
+    // """
+    pool: rayon::ThreadPool,
+    phantom: std::marker::PhantomData<(StateRoot, Witness, Da)>,
+}
+
+impl<Address, StateRoot, Witness, Da> Prover<Address, StateRoot, Witness, Da>
+where
+    Da: DaService,
+    Address:
+        BorshSerialize + Serialize + DeserializeOwned + AsRef<[u8]> + Clone + Send + Sync + 'static,
+    StateRoot: Serialize
+        + DeserializeOwned
+        + Clone
+        + AsRef<[u8]>
+        + PartialEq
+        + core::fmt::Debug
+        + Send
+        + Sync
+        + 'static,
+    Witness: Serialize + DeserializeOwned + Send + Sync + 'static,
+{
+    pub(crate) fn new(prover_address: Address, num_threads: usize) -> Self {
+        Self {
+            num_threads,
+            pool: rayon::ThreadPoolBuilder::new()
+                .num_threads(num_threads)
+                .build()
+                .unwrap(),
+
+            prover_state: Arc::new(RwLock::new(ProverState {
+                prover_status: Default::default(),
+                pending_tasks_count: Default::default(),
+            })),
+            prover_address,
+            phantom: PhantomData,
+        }
+    }
+
+    pub(crate) fn start_proving<InnerVm>(
+        &self,
+        state_transition_info: StateTransitionInfo<StateRoot, Witness, <Da as DaService>::Spec>,
+        inner_vm: InnerVm::Host,
+        verifier: Arc<Verifier<Da>>,
+    ) -> Result<
+        ProofProcessingStatus<StateRoot, Witness, <Da as DaService>::Spec>,
+        ProverServiceError,
+    >
+    where
+        InnerVm: Zkvm + 'static,
+    {
+        let block_header_hash = state_transition_info.da_block_header().hash();
+
+        let mut prover_state = self.prover_state.write().expect("Lock was poisoned");
+        if let Some(duplicate_proof) = prover_state.get_prover_status(&block_header_hash) {
+            return match duplicate_proof {
+                ProverStatus::ProvingInProgress => Err(anyhow::anyhow!(
+                    "Proof generation for {} still in progress",
+                    block_header_hash
+                )
+                .into()),
+                ProverStatus::Proved(_) => Err(anyhow::anyhow!(
+                    "Witness for block_header_hash {}, submitted multiple times.",
+                    block_header_hash,
+                )
+                .into()),
+                ProverStatus::Err(e) => Err(anyhow::format_err!("{}", e).into()), // "Clone" the anyhow error without cloning, because anyhow doesn't support that
+            };
+        }
+
+        let start_prover = prover_state.inc_task_count_if_not_busy(self.num_threads);
+
+        let prover_state_clone = self.prover_state.clone();
+        // Initiate a new proving job only if the prover is not busy.
+        if start_prover {
+            prover_state.set_to_proving(block_header_hash.clone());
+
+            let StateTransitionInfo {
+                data,
+                aggregated_proofs,
+            } = state_transition_info;
+
+            let slot_number = data.slot_number;
+
+            let data = StateTransitionWitnessWithAddress {
+                stf_witness: data,
+                prover_address: self.prover_address.clone(),
+            };
+
+            let span_block_header_hash = block_header_hash.clone();
+            self.pool.spawn(move || {
+                tracing::info_span!("guest_execution", slot_number = %slot_number).in_scope(|| {
+                    info!(
+                        "Submitting inner proof for slot {} (slot_hash={})",
+                        slot_number, span_block_header_hash
+                    );
+                    let inner_proof =
+                        Self::make_inner_proof::<InnerVm>(inner_vm, &data, aggregated_proofs);
+
+                    let mut prover_state = prover_state_clone.write().expect("Lock was poisoned");
+
+                    let StateTransitionWitnessWithAddress {
+                        stf_witness:
+                            StateTransitionWitness {
+                                initial_state_root,
+                                final_state_root,
+                                da_block_header,
+                                relevant_proofs,
+                                relevant_blobs: blobs,
+                                ..
+                            },
+                        prover_address,
+                    } = data;
+
+                    verifier
+                        .da_verifier
+                        .verify_relevant_tx_list(&da_block_header, &blobs, relevant_proofs)
+                        .expect("An honest prover provided an invalid list of relevant txs. This is a bug in the prover - please report it.");
+
+                    let block_proof = inner_proof.map(|proof| BlockProof {
+                        proof,
+                        st: StateTransitionPublicData::<Address, Da::Spec, StateRoot> {
+                            initial_state_root,
+                            final_state_root,
+                            slot_number,
+                            slot_hash: block_header_hash.clone(),
+                            prover_address,
+                        },
+                    });
+
+                    prover_state.set_to_proved(block_header_hash, block_proof);
+                    prover_state.dec_task_count();
+                });
+            });
+
+            Ok(ProofProcessingStatus::ProvingInProgress)
+        } else {
+            Ok(ProofProcessingStatus::Busy(state_transition_info))
+        }
+    }
+
+    pub(crate) async fn create_aggregated_proof<OuterVm: OuterZkvmHost>(
+        &self,
+        outer_vm: OuterVm,
+        block_headers: &[<Da::Spec as DaSpec>::BlockHeader],
+    ) -> anyhow::Result<ProofAggregationStatus> {
+        assert!(!block_headers.is_empty());
+
+        let headers_with_block_proofs = {
+            let prover_state = self.prover_state.read().expect("Lock was poisoned");
+
+            let mut headers_with_block_proofs = Vec::with_capacity(block_headers.len());
+
+            for block_header in block_headers {
+                let slot_hash = &block_header.hash();
+                let state = prover_state.get_prover_status(slot_hash);
+
+                match state {
+                    Some(ProverStatus::ProvingInProgress) => {
+                        return Ok(ProofAggregationStatus::ProofGenerationInProgress);
+                    }
+                    Some(ProverStatus::Proved(block_proof)) => {
+                        assert_eq!(slot_hash, &block_proof.st.slot_hash);
+                        headers_with_block_proofs.push((block_header.clone(), block_proof.clone()));
+                    }
+                    Some(ProverStatus::Err(e)) => return Err(anyhow::anyhow!(e.to_string())),
+                    None => return Err(anyhow::anyhow!("Missing required proof of {:?}. Use the `prove` method to generate a proof of that block and try again.", slot_hash)),
+                }
+            }
+
+            headers_with_block_proofs
+        };
+
+        let (tx, rx) = oneshot::channel();
+        self.pool.spawn(move || {
+            let proving_start = std::time::Instant::now();
+            let result = outer_vm.run_proof_aggregation(headers_with_block_proofs);
+
+            sov_metrics::track_metrics(|tracker| {
+                let proving_time = proving_start.elapsed();
+                let is_success = result.is_ok();
+                tracker.submit(sov_metrics::ZkProvingTime {
+                    proving_time,
+                    is_success,
+                    zk_circuit: sov_metrics::ZkCircuit::Outer,
+                });
+            });
+
+            let _ = tx.send(result);
+        });
+
+        let serialized_aggregated_proof = rx
+            .await
+            .map_err(|_| anyhow::anyhow!("Proof aggregation task terminated"))??;
+
+        {
+            // Keep inner proofs available until the outer aggregation succeeds so
+            // zk-manager retries can reuse them after transient failures.
+            let mut prover_state = self.prover_state.write().expect("Lock was poisoned");
+            for header in block_headers {
+                prover_state.remove(&header.hash());
+            }
+        }
+
+        Ok(ProofAggregationStatus::Success(serialized_aggregated_proof))
+    }
+
+    fn make_inner_proof<InnerVm>(
+        mut vm: InnerVm::Host,
+        hint: &StateTransitionWitnessWithAddress<Address, StateRoot, Witness, Da::Spec>,
+        serialized_agg_proofs: Vec<SerializedAggregatedProof>,
+    ) -> anyhow::Result<SerializedZkProof>
+    where
+        InnerVm: Zkvm + 'static,
+    {
+        let proving_start = std::time::Instant::now();
+        info!("Generating proof with {}", std::any::type_name::<InnerVm>());
+
+        let result = vm.add_hint_deferred_and_run(hint, serialized_agg_proofs);
+        sov_metrics::track_metrics(|tracker| {
+            let proving_time = proving_start.elapsed();
+            let is_success = result.is_ok();
+            tracker.submit(sov_metrics::ZkProvingTime {
+                proving_time,
+                is_success,
+                zk_circuit: sov_metrics::ZkCircuit::Inner,
+            });
+        });
+        match result {
+            Ok(ref proof) => {
+                trace!(
+                    bytes = proof.len(),
+                    "Proof generation completed successfully"
+                );
+            }
+            Err(ref e) => {
+                error!("Proof generation failed: {:?}", e);
+            }
+        }
+        result
+    }
+}

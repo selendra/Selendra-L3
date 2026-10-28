@@ -3,7 +3,7 @@
 use anyhow::Context;
 use clap::Parser;
 use rollup_starter::da::DaService;
-use rollup_starter::rollup::StarterRollup;
+use rollup_starter::rollup::{CannotResumeProving, StarterRollup};
 use sov_modules_rollup_blueprint::logging::initialize_logging;
 use sov_modules_rollup_blueprint::FullNodeBlueprint;
 use sov_modules_rollup_blueprint::Rollup;
@@ -120,7 +120,7 @@ async fn main() {
     let prover_config = parse_prover_config().expect("Malformed prover_config");
     tracing::info!(?prover_config, "Running demo rollup with prover config");
 
-    let rollup = new_rollup(
+    let rollup = match new_rollup(
         args.genesis_path,
         args.rollup_config_path,
         prover_config,
@@ -129,8 +129,28 @@ async fn main() {
         args.start_fresh_outer_proof_on_resync,
     )
     .await
-    .expect("Couldn't start rollup");
+    {
+        Err(error) if error.downcast_ref::<CannotResumeProving>().is_some() => {
+            restart_without_proving(&error)
+        }
+        result => result.expect("Couldn't start rollup"),
+    };
     rollup.run().await.expect("Couldn't run rollup");
+}
+
+/// Selendra: if this node can no longer extend the proof chain, keep it running (it may be the sequencer)
+/// without the proof pipeline instead of failing to start. The SDK keeps process-wide state from the first
+/// start attempt, so the process re-executes itself with `SOV_PROVER_MODE` removed.
+fn restart_without_proving(error: &anyhow::Error) -> ! {
+    use std::os::unix::process::CommandExt;
+
+    tracing::error!(%error, "Restarting the rollup with proving disabled");
+    let exe = std::env::current_exe().expect("Failed to locate the rollup executable");
+    let exec_error = std::process::Command::new(exe)
+        .args(std::env::args_os().skip(1))
+        .env_remove("SOV_PROVER_MODE")
+        .exec();
+    panic!("Failed to restart the rollup with proving disabled: {exec_error}");
 }
 
 fn parse_prover_config() -> anyhow::Result<RollupProverConfig> {

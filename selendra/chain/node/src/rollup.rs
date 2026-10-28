@@ -158,6 +158,28 @@ impl FullNodeBlueprint<Native> for StarterRollup<Native> {
 
         let latest_proof_final_slot = previous_public_data.as_ref().map(|p| p.final_slot_number);
 
+        // Selendra: if any STF info after the last accepted aggregated proof is gone, this node cannot extend the
+        // proof chain. That happens when the chain stops accepting its proofs (e.g. the prover bond ran out): the
+        // node keeps proving, its proofs are rejected, and the STF infos they used get pruned. Resuming then panics
+        // in the SDK (missing STF info, or the aggregation's slot-continuity assertion), and a fresh outer proof gets
+        // the prover slashed (IncorrectGenesisHash), so refuse to start proving with an actionable error instead.
+        // `--start-fresh-outer-proof-on-resync` keeps the SDK behaviour.
+        if !start_fresh_outer_proof_on_resync {
+            if let Some(final_slot) = latest_proof_final_slot {
+                if let Some((missing, last)) =
+                    first_missing_stf_info(ledger_db, final_slot.next()).await?
+                {
+                    return Err(CannotResumeProving(format!(
+                        "the last accepted aggregated proof ends at slot {final_slot}, but the proving data (STF \
+                         info) for slot {missing} is not stored (needed up to slot {last}), so this node \
+                         cannot extend the proof chain. Check that the prover is bonded, then resync this node from \
+                         genesis with proving enabled (or let another prover take over)."
+                    ))
+                    .into());
+                }
+            }
+        }
+
         let previous_for_outer = if start_fresh_outer_proof_on_resync {
             None
         } else {
@@ -280,4 +302,37 @@ async fn read_latest_aggregated_proof(ledger_db: &LedgerDb) -> Option<Serialized
             .expect("Failed to read latest aggregated proof from ledger DB")?
             .proof,
     )
+}
+
+/// Proving cannot resume from the last accepted aggregated proof (see `create_prover_service`).
+/// The rollup binary catches it and starts the node without the proof pipeline.
+#[derive(Debug)]
+pub struct CannotResumeProving(String);
+
+impl std::fmt::Display for CannotResumeProving {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Cannot resume proving: {}", self.0)
+    }
+}
+
+impl std::error::Error for CannotResumeProving {}
+
+/// Returns `(missing, last)` for the first slot in `next..=last` whose STF info is not stored, where `last` is the
+/// later of the newest stored STF info and the node's head slot. Proving resumes at `next` and needs every slot
+/// up to the head: slots processed while the node ran without proving have no STF info at all.
+async fn first_missing_stf_info(
+    ledger_db: &LedgerDb,
+    next: SlotNumber,
+) -> anyhow::Result<Option<(SlotNumber, SlotNumber)>> {
+    let write_slot = ledger_db.get_stf_info_write_slot_number().await?;
+    let head_slot = ledger_db.get_head_slot()?.map(|(slot, _)| slot);
+    let Some(last) = write_slot.max(head_slot) else {
+        return Ok(None);
+    };
+    for slot in next.range_inclusive(last) {
+        if ledger_db.get_stf_info(slot)?.is_none() {
+            return Ok(Some((slot, last)));
+        }
+    }
+    Ok(None)
 }

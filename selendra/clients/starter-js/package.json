@@ -10,7 +10,8 @@
     "hyperlane-inbound": "npm run schema && node --no-warnings --loader ts-node/esm src/hyperlane/starter-inbound-transfer.ts",
     "hyperlane-outbound": "npm run schema && node --no-warnings --experimental-wasm-modules --loader ts-node/esm src/hyperlane/starter-outbound-transfer.ts",
     "transfer": "npm run schema && node --no-warnings --experimental-wasm-modules --loader ts-node/esm src/transfer.ts",
-    "security": "npm run schema && node --no-warnings --experimental-wasm-modules --loader ts-node/esm src/security.ts"
+    "security": "npm run schema && node --no-warnings --experimental-wasm-modules --loader ts-node/esm src/security.ts",
+    "prover-bond": "npm run schema && node --no-warnings --experimental-wasm-modules --loader ts-node/esm src/prover-bond.ts"
   },
   "author": "",
   "license": "ISC",
