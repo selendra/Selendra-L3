@@ -2,12 +2,14 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use sov_address::{EthereumAddress, FromVmAddress};
 use sov_eip712_auth::{SchemaProvider, Secp256k1CryptoSpec};
 use sov_modules_api::capabilities::{
-    self, BatchFromUnregisteredSequencer, TransactionAuthenticator, UnregisteredAuthenticationError,
+    self, BatchFromUnregisteredSequencer, FatalError, TransactionAuthenticator,
+    UnregisteredAuthenticationError,
 };
 use sov_modules_api::runtime::capabilities::AuthenticationError;
 use sov_modules_api::{
     DispatchCall, FullyBakedTx, GetGasPrice, ProvableStateReader, RawTx, Runtime, Spec,
 };
+use sov_rollup_interface::TxHash;
 use sov_state::User;
 use std::marker::PhantomData;
 
@@ -23,6 +25,45 @@ pub enum EvmAndEip712AuthenticatorInput<T = RawTx, U = RawTx> {
     /// Authenticate using the standard `sov-module` authenticator, which uses the default
     /// signature scheme and hashing algorithm defined in the rollup's [`Spec`].
     Standard(U),
+}
+
+/// Rejects an EVM transaction whose declared gas limit exceeds the chain's limit
+/// (`min(tx_gas_limit, block_gas_limit)` from the EVM chain spec), as Ethereum does.
+/// Without this, `sov-evm` accepts the transaction and silently clamps its gas at execution.
+/// Runs before signature recovery so oversized transactions are dropped cheaply.
+fn check_evm_gas_limit<S, Accessor>(
+    raw_tx: &[u8],
+    state: &mut Accessor,
+) -> Result<(), AuthenticationError>
+where
+    S: Spec,
+    Accessor: ProvableStateReader<User, Spec = S>,
+{
+    use alloy_consensus::Transaction;
+
+    // Undecodable transactions are reported by `sov_evm::authenticate` with its usual error.
+    let Ok((_rlp, tx)) = sov_evm::decode_evm_tx(raw_tx) else {
+        return Ok(());
+    };
+    let tx_hash = TxHash::new(**tx.hash());
+    let spec = sov_evm::Evm::<S>::default()
+        .cfg(state)
+        .map_err(|e| AuthenticationError::OutOfGas(format!("check_evm_gas_limit: {e}")))?
+        .chain_spec;
+    let limit = spec
+        .tx_gas_limit
+        .unwrap_or(spec.block_gas_limit)
+        .min(spec.block_gas_limit);
+    if tx.gas_limit() > limit {
+        return Err(AuthenticationError::FatalError(
+            FatalError::Other(format!(
+                "Transaction gas limit {} exceeds the chain gas limit {limit}",
+                tx.gas_limit()
+            )),
+            tx_hash,
+        ));
+    }
+    Ok(())
 }
 
 /// EVM-compatible transaction authenticator. See [`TransactionAuthenticator`].
@@ -59,6 +100,7 @@ where
 
         match input {
             EvmAndEip712AuthenticatorInput::Evm(tx) => {
+                check_evm_gas_limit(&tx.data, state)?;
                 let (tx_and_raw_hash, auth_data, runtime_call) =
                     sov_evm::authenticate::<_, _>(&tx.data, state)?;
 

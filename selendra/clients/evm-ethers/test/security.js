@@ -125,7 +125,22 @@ await check("unfunded account can't execute a zero-value tx for free (gas must b
 area = "limits";
 await check("gas limit above the block gas limit is rejected", async () => {
   const { gasLimit } = await provider.getBlock("latest");
-  return rejected(async () => broadcast((await signRaw(alice, { to: sink, nonce: aliceNonce, gasLimit: gasLimit + 1n })).serialized));
+  let hash;
+  try {
+    hash = await broadcast((await signRaw(alice, { to: sink, nonce: aliceNonce, gasLimit: gasLimit + 1n })).serialized);
+  } catch (e) {
+    const m = errMsg(e).match(/Transaction gas limit \d+ exceeds the chain gas limit \d+/);
+    assert(m, `rejected for another reason: ${errMsg(e).slice(0, 120)}`);
+    return `rejected: ${m[0]}`;
+  }
+  throw new Error(`accepted (${hash})`);
+});
+await check("gas limit exactly at the block gas limit is still accepted", async () => {
+  const { gasLimit } = await provider.getBlock("latest");
+  const r = await waitMined(await broadcast((await signRaw(alice, { to: sink, nonce: aliceNonce, gasLimit })).serialized));
+  aliceNonce++;
+  assert(r.status === 1, `status ${r.status}`);
+  return `mined, gas used ${r.gasUsed}`;
 });
 await check("tx larger than MAX_TX_SIZE (1 MiB) is rejected", async () => {
   const data = hexlify(randomBytes(1_100_000));
