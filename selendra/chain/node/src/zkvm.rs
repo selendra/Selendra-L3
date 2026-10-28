@@ -108,7 +108,8 @@ mod mock_zkvm {
     }
 
     pub async fn create_inner_vm() -> ZkvmHost {
-        ZkvmHost::new()
+        // `new()` blocks every proof until a test harness releases it, which deadlocks a live node.
+        ZkvmHost::new_non_blocking()
     }
 
     pub type Hasher = <sov_mock_zkvm::MockZkvmCryptoSpec as CryptoSpec>::Hasher;

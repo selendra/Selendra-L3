@@ -9,7 +9,8 @@
     "deploy": "node src/deploy.js",
     "demo": "node src/demo.js",
     "watch": "node src/watch.js",
-    "compat": "node test/compat.js"
+    "compat": "node test/compat.js",
+    "security": "node test/security.js"
   },
   "dependencies": {
     "ethers": "6.15.0",

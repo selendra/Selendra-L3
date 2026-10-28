@@ -134,21 +134,19 @@ async fn main() {
 }
 
 fn parse_prover_config() -> anyhow::Result<RollupProverConfig> {
-    if let Some(value) = option_env!("SOV_PROVER_MODE") {
-        tracing::warn!("SOV_PROVER_MODE is set to {}, but proving is not currently supported. Ignoring prover config.", value);
-        Ok(RollupProverConfig::Disabled)
-        // TODO: Re-enable proving once https://github.com/Sovereign-Labs/sovereign-sdk-wip/issues/2814 is resolved
-        //
-        // let config = std::str::FromStr::from_str(value).inspect_err(|&error| {
-        //     tracing::error!(value, ?error, "Unknown `SOV_PROVER_MODE` value; aborting");
-        // })?;
-        // #[cfg(debug_assertions)]
-        // {
-        //     if config == RollupProverConfig::Prove {
-        //         tracing::warn!(prover_config = ?config, "Given RollupProverConfig might cause slow rollup progression if not compiled in release mode.");
-        //     }
-        // }
-        // Ok(config)
+    // Selendra: read at runtime (upstream disabled proving, see sovereign-sdk-wip#2814).
+    // Only the mock zkVM is wired up in `create_prover_service`.
+    if let Ok(value) = std::env::var("SOV_PROVER_MODE") {
+        let config = std::str::FromStr::from_str(&value).inspect_err(|error| {
+            tracing::error!(value, ?error, "Unknown `SOV_PROVER_MODE` value; aborting");
+        })?;
+        #[cfg(debug_assertions)]
+        {
+            if config == RollupProverConfig::Prove {
+                tracing::warn!(prover_config = ?config, "Given RollupProverConfig might cause slow rollup progression if not compiled in release mode.");
+            }
+        }
+        Ok(config)
     } else {
         Ok(RollupProverConfig::Disabled)
     }
