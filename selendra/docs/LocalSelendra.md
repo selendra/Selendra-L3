@@ -414,7 +414,7 @@ The prover guest crates under `chain/provers/*/guest-*` pin it too. One script u
 
 ```bash
 ./scripts/update_rev.sh <new-sovereign-sdk-commit>   # run from selendra/
-python3 scripts/vendor_sov_sequencer.py              # re-vendor + re-patch the sequencer (modules/patches/README.md)
+python3 scripts/vendor_sdk_crates.py                # re-vendor + re-patch sov-sequencer and sov-evm (modules/patches/README.md)
 cargo update -p sov-modules-api                      # refresh Cargo.lock
 cargo build && cargo test -p rollup-starter          # fix compile errors, then run Mode A and Mode B again
 ```

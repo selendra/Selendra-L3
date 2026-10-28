@@ -7,8 +7,11 @@ section of the root `Cargo.toml`.
 | Crate | Patches | Why |
 |---|---|---|
 | `sov-sequencer` (in `modules/sov-sequencer`) | `0001-skip-empty-batches-while-idle.patch` (this folder) | Don't post an empty batch to Celestia on every DA block |
+| `sov-evm` (in `modules/sov-evm`) | `0002-evm-rpc-block-by-synthetic-hash.patch` (this folder) | `eth_getBlockByHash` returned "block not found" for a just-sealed block |
 
-`modules/sov-sequencer/` is **generated**. Don't edit it by hand: edit it, then regenerate the `.patch` (see below).
+`modules/sov-sequencer/` and `modules/sov-evm/` are **generated** by `scripts/vendor_sdk_crates.py` (the crate list
+and each crate's patches are in `CRATES` at the top of the script). Don't edit them by hand: edit, then regenerate
+the `.patch` (see below).
 
 ## 0001 — skip empty batches while idle
 
@@ -44,17 +47,33 @@ u8, max 255). Raising it to e.g. 200 would mean one empty batch per ~200 blocks 
 the STF and changes the chain, so it needs a rebuild and `make clean-db` (new genesis) — do it before a public launch,
 not on a running network.
 
+## 0002 — eth_getBlockByHash for a just-sealed block
+
+**Problem.** Soft-confirmed EVM blocks have a synthetic hash (`0x73796e746865746963…`, "synthetic"). Looking one up
+with `eth_getBlockByHash` failed with "block not found" for several seconds after the block was sealed: measured on
+the local chain, 6 of 10 lookups at +3 s and +10 s failed, while `eth_getBlockByNumber` for the same block worked.
+
+**Cause** (`get_maybe_sealed_block_by_id` in `src/rpc/block_resolution.rs`). For a synthetic hash whose block number
+equals `block_env.number`, the RPC rebuilt the block from the pending transactions. Between `finalize_hook` (which
+seals the block and clears the pending txs) and the next `begin_rollup_block_hook`, `block_env` still has that
+number, so the pending list was empty and the lookup failed.
+
+**Fix.** Use the pending path only while the block is not sealed yet; otherwise rebuild it from the sealed block (the
+existing "Case 2"), which is the order `get_maybe_sealed_block` already uses.
+
+**Safety.** RPC-only code (`native` feature): no change to the STF, state roots or the ZK guests.
+
 ## Updating after an SDK upgrade
 
 ```bash
 ./scripts/update_rev.sh <new-sdk-rev>
-python3 scripts/vendor_sov_sequencer.py          # re-vendor from the new rev and re-apply modules/patches/*.patch
+python3 scripts/vendor_sdk_crates.py            # re-vendor from the new rev and re-apply the patches
 cargo build && make selendra-evm-compat           # then check idle behaviour (see docs/LocalSelendra.md)
 ```
 
 If a patch no longer applies, the script stops and says which one. Re-apply the change by hand in
-`modules/sov-sequencer`, then regenerate the patch against the pristine sources (the script caches them in
-`target/sdk-src/<rev>/crates/full-node/sov-sequencer`):
+`modules/<crate>`, then regenerate the patch against the pristine sources (the script caches them in
+`target/sdk-src/<rev>/<crate path>`). For `sov-sequencer`:
 
 ```bash
 cd /tmp && rm -rf a b && cp -r ~/project/selendra/target/sdk-src/<rev>/crates/full-node/sov-sequencer/src a \

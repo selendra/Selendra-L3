@@ -51,4 +51,4 @@ for file in "${FILES[@]}"; do
 done
 
 echo
-echo "Next: re-vendor the patched sequencer for the new rev:  python3 scripts/vendor_sov_sequencer.py $NEW_REV"
+echo "Next: re-vendor the patched SDK crates for the new rev:  python3 scripts/vendor_sdk_crates.py $NEW_REV"

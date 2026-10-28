@@ -33,7 +33,7 @@ make selendra-evm-compat                                 # full compatibility su
 | File | What it does |
 |---|---|
 | `contracts/*.sol` | Your Solidity contracts (`SelendraToken.sol` is a minimal ERC-20). Add more files here |
-| `src/config.js` | RPC/WS URLs, chain ID, dev key, `connect()` / `connectWs()` and `SelendraWallet` |
+| `src/config.js` | RPC/WS URLs, chain ID, dev key, `connect()` / `connectWs()` (ethers request cache off) |
 | `src/compile.js` | Compiles `contracts/*.sol` with solc-js and writes `artifacts/<Name>.json` (abi + bytecode). No Foundry or Hardhat needed |
 | `src/deploy.js` | Deploys a contract by name with constructor args |
 | `src/demo.js` | Network info → deploy ERC-20 → `eth_call` reads → transfer + receipt events → `eth_getLogs` → revert reason → native SEL send |
@@ -44,7 +44,7 @@ Use it in your own code:
 
 ```js
 import { connect } from "./src/config.js";
-const { provider, wallet } = connect();   // wallet is a SelendraWallet (an ethers Wallet)
+const { provider, wallet } = connect();   // ethers JsonRpcProvider (cacheTimeout: -1) + Wallet
 const token = new Contract(address, abi, wallet);
 await (await token.transfer(to, amount)).wait();
 ```
@@ -141,7 +141,7 @@ Ethereum (plus the block-timestamp behaviour found afterwards, #7), and 24 optio
 | 3 | **Receipt `blockHash` is a placeholder at first.** Right after soft confirmation, the receipt's `blockHash` is `0x73796e7468657469635f626c6f636b5f68617368…` (ASCII "synthetic_block_hash"). It becomes the real hash once the EVM block is sealed, about one DA block later. `blockNumber`, `transactionHash` and logs are final immediately. | Key data by `transactionHash` or `blockNumber`, not by `blockHash`. If you need the hash, re-read the receipt after the next block. |
 | 4 | **Contract size limit is 512 KiB, not 24 KB (EIP-170).** It is set in genesis: `evm.chain_spec.limit_contract_code_size = 524288`. | Set it to `24576` in `configs/*/genesis.json` for strict Ethereum parity. That is a genesis change, so run `make clean-db`. The admin can also change it later through the EVM module's `ChainSpecUpdate`. |
 | 5 | **`SELFDESTRUCT` of a contract created in the same tx fails** (`selfdestruct unsupported`), where Ethereum would delete it. `SELFDESTRUCT` on older contracts works (EIP-6780 behaviour). | The opcode is deprecated; avoid factory patterns that create and destroy in one tx. |
-| 6 | **Nonce lag right after a confirmation** (described below). | Use `SelendraWallet` (ethers) or keep the nonce in your client. |
+| 6 | **ethers reuses a cached nonce on back-to-back sends** (described below). Not a node issue. | Create ethers providers with `cacheTimeout: -1` (`connect()` does). |
 | 7 | **On an idle chain, EVM blocks and `block.timestamp` advance in steps.** New EVM blocks come with rollup batches. While idle, Selendra posts an empty batch only every ~19 DA blocks (~2 min; see `modules/patches/README.md`), and a block's timestamp is that of the last block with txs. Measured before the batch patch: 612 s stale before a tx, 20 s after. | Don't rely on `block.timestamp` in `eth_call`/view functions being current on a quiet chain. Pass the time in from the client, or check it inside a transaction. |
 
 ### ❌ Not available (N/A)
@@ -169,23 +169,33 @@ Ethereum (plus the block-timestamp behaviour found afterwards, #7), and 24 optio
 | Tool | Result |
 |---|---|
 | ethers 6.15 (`clients/evm-ethers`) | ✅ everything above, plus `make selendra-evm-demo` |
-| ethers stress: 30 back-to-back txs (deploy + call + send, ×10) | ✅ 0 failures in 2.1 s with `SelendraWallet` |
+| ethers stress: 30 back-to-back txs (deploy + call + send, ×10) | ✅ 0 failures in 2.1 s (measured with the earlier client-side nonce workaround) |
 | viem 2.21 | ✅ `defineChain`, reads, `sendTransaction`, `waitForTransactionReceipt` |
 | Hardhat 2.22 + hardhat-ethers | ✅ compile, deploy, call, transfer |
 | Foundry | not installed on the test machine; standard flags above. See `testing/foundry-tests/` |
 
 ---
 
-## The nonce lag in detail
+## Back-to-back sends with ethers
 
-Selendra soft-confirms a tx in about 50 ms. For a short moment after that, `eth_getTransactionCount` can still return
-the old nonce, because the RPC reads committed state while the sequencer is already ahead. Selendra's
-`eth_estimateGas` also rejects a stale nonce, so a script that sends txs back-to-back can fail with `nonce too low`.
+ethers v6 caches identical RPC requests for 250 ms (`cacheTimeout`). Selendra soft-confirms a tx in about 50 ms, so
+when a script sends a tx, waits for its receipt and sends the next one, ethers answers the second
+`eth_getTransactionCount`, `eth_estimateGas` and fee requests from that cache. It signs the new tx with the previous
+nonce and the node rejects it ("Tx bad nonce … expected: 1, but found: 0"; ethers reports "could not coalesce error").
+On Ethereum, 12 s blocks hide this cache.
 
-**Fix:** track the nonce in the client. `SelendraWallet` in `clients/evm-ethers/src/config.js` does this. It is an
-ethers `Wallet` that uses `max(network nonce, last sent + 1)`. ethers' own `NonceManager` is **not** enough here: it
-sets the nonce only after gas was estimated with the stale one. Wallets used by people (MetaMask) aren't affected in
-practice.
+The node itself returns the right nonce: measured on the local chain, `eth_getTransactionCount` with `latest` and
+`pending` was correct at every point from 0 to 9 s after inclusion, and back-to-back sends without waiting work too.
+
+**Fix:** turn the cache off when you create the provider:
+
+```js
+new JsonRpcProvider(url, network, { cacheTimeout: -1 });
+new WebSocketProvider(wsUrl, network, { cacheTimeout: -1 });
+```
+
+`connect()` / `connectWs()` in `clients/evm-ethers/src/config.js` already do this. Other clients (viem, MetaMask,
+Foundry) were not tested for this case.
 
 ## Other things to know
 

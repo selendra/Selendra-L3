@@ -2,7 +2,7 @@
 // node-held-key RPC methods and API hardening. Run with the node up: `npm run security` (or `make selendra-security`).
 // Prints one line per check and a summary. Exit code is 1 if any required check fails.
 import { Signature, Transaction, Wallet, hexlify, parseEther, randomBytes, toBeHex } from "ethers";
-import { CHAIN_ID, RPC_URL, SelendraWallet, connect } from "../src/config.js";
+import { CHAIN_ID, RPC_URL, connect } from "../src/config.js";
 
 const { provider, wallet } = connect();
 const API = new URL(RPC_URL).origin;
@@ -35,7 +35,7 @@ const rejected = async (fn) => {
 };
 const sendTx = async (tx) => (await wallet.sendTransaction(tx)).wait();
 const freshWallet = async (sel = "0.05") => {
-  const w = new SelendraWallet(Wallet.createRandom().privateKey, provider);
+  const w = new Wallet(Wallet.createRandom().privateKey, provider);
   if (sel) await sendTx({ to: w.address, value: parseEther(sel) });
   return w;
 };
@@ -62,8 +62,7 @@ const N = 0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141n; /
 console.log(`Selendra security suite — ${await rpc("web3_clientVersion")} on ${RPC_URL}\n`);
 const alice = await freshWallet("0.1");
 const sink = Wallet.createRandom().address;
-// The RPC can briefly report a stale nonce right after inclusion (see config.js), so track alice's nonce here:
-// only txs that were actually mined advance it.
+// Raw txs are signed with explicit nonces, so track alice's nonce here: only txs that were actually mined advance it.
 let aliceNonce = 0;
 
 // ---------- replay & signatures ----------
@@ -108,7 +107,7 @@ await check("garbage raw tx bytes are rejected", async () => rejected(() => broa
 // ---------- balances & limits ----------
 area = "balance";
 await check("unfunded account can't transfer value", async () => {
-  const w = new SelendraWallet(Wallet.createRandom().privateKey, provider);
+  const w = new Wallet(Wallet.createRandom().privateKey, provider);
   return rejected(async () => waitMined(await broadcast((await signRaw(w, { to: sink, nonce: 0, value: parseEther("1") })).serialized), 6000));
 });
 await check("value above balance is rejected and balance is unchanged", async () => {
@@ -119,7 +118,7 @@ await check("value above balance is rejected and balance is unchanged", async ()
   return reason;
 });
 await check("unfunded account can't execute a zero-value tx for free (gas must be paid)", async () => {
-  const w = new SelendraWallet(Wallet.createRandom().privateKey, provider);
+  const w = new Wallet(Wallet.createRandom().privateKey, provider);
   return rejected(async () => waitMined(await broadcast((await signRaw(w, { to: sink, nonce: 0, value: 0n })).serialized), 8000));
 }, "info");
 area = "limits";

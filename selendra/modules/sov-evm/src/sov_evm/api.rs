@@ -1,0 +1,98 @@
+use super::{evm::SovEvm, handler::SovHandler};
+use revm::{
+    context::{
+        result::{ExecResultAndState, HaltReason, InvalidTransaction},
+        ContextSetters,
+    },
+    context_interface::{
+        result::{EVMError, ExecutionResult},
+        ContextTr, Database, JournalTr,
+    },
+    handler::{EvmTr, Handler, PrecompileProvider},
+    inspector::{InspectCommitEvm, InspectEvm, Inspector, InspectorHandler, JournalExt},
+    interpreter::{interpreter::EthInterpreter, InterpreterResult},
+    state::EvmState,
+    DatabaseCommit, ExecuteCommitEvm, ExecuteEvm,
+};
+
+/// Type alias for the error type of the OpEvm.
+type MyError<CTX> = EVMError<<<CTX as ContextTr>::Db as Database>::Error, InvalidTransaction>;
+
+// Trait that allows to replay and transact the transaction.
+impl<CTX, INSP, P> ExecuteEvm for SovEvm<CTX, INSP, P>
+where
+    CTX: ContextSetters<Journal: JournalTr<State = EvmState>>,
+    P: PrecompileProvider<CTX, Output = InterpreterResult>,
+{
+    type State = EvmState;
+    type ExecutionResult = ExecutionResult<HaltReason>;
+    type Error = MyError<CTX>;
+
+    type Tx = <CTX as ContextTr>::Tx;
+
+    type Block = <CTX as ContextTr>::Block;
+
+    fn set_block(&mut self, block: Self::Block) {
+        self.0.ctx.set_block(block);
+    }
+
+    fn transact_one(&mut self, tx: Self::Tx) -> Result<Self::ExecutionResult, Self::Error> {
+        self.0.ctx.set_tx(tx);
+        let mut handler = SovHandler::default();
+        handler.run(self)
+    }
+
+    fn finalize(&mut self) -> Self::State {
+        self.ctx().journal_mut().finalize()
+    }
+
+    fn replay(
+        &mut self,
+    ) -> Result<ExecResultAndState<Self::ExecutionResult, Self::State>, Self::Error> {
+        let mut handler = SovHandler::default();
+        handler.run(self).map(|result| {
+            let state = self.finalize();
+            ExecResultAndState::new(result, state)
+        })
+    }
+}
+
+// Trait allows replay_commit and transact_commit functionality.
+impl<CTX, INSP, P> ExecuteCommitEvm for SovEvm<CTX, INSP, P>
+where
+    CTX: ContextSetters<Db: DatabaseCommit, Journal: JournalTr<State = EvmState>>,
+    P: PrecompileProvider<CTX, Output = InterpreterResult>,
+{
+    fn commit(&mut self, state: Self::State) {
+        self.ctx().db_mut().commit(state);
+    }
+}
+
+// Inspection trait.
+impl<CTX, INSP, P> InspectEvm for SovEvm<CTX, INSP, P>
+where
+    CTX: ContextSetters<Journal: JournalTr<State = EvmState> + JournalExt>,
+    INSP: Inspector<CTX, EthInterpreter>,
+    P: PrecompileProvider<CTX, Output = InterpreterResult>,
+{
+    type Inspector = INSP;
+
+    fn set_inspector(&mut self, inspector: Self::Inspector) {
+        self.0.inspector = inspector;
+    }
+
+    fn inspect_one_tx(&mut self, tx: Self::Tx) -> Result<Self::ExecutionResult, Self::Error> {
+        self.0.ctx.set_tx(tx);
+        let mut handler = SovHandler::default();
+        handler.inspect_run(self)
+    }
+}
+
+// Inspect
+impl<CTX, INSP, P> InspectCommitEvm for SovEvm<CTX, INSP, P>
+where
+    CTX: ContextSetters<Db: DatabaseCommit, Journal: JournalTr<State = EvmState> + JournalExt>,
+    INSP: Inspector<CTX, EthInterpreter>,
+    P: PrecompileProvider<CTX, Output = InterpreterResult>,
+{
+}

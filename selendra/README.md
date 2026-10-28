@@ -24,7 +24,7 @@ make help               # all commands
 | Folder | What it holds |
 |---|---|
 | `chain/` | **Main code**: `node/` (binary), `runtime/` (module list), `stf/`, `provers/`, `node-discovery/` |
-| `modules/` | Custom modules, one folder per module (`value-setter` is the example), plus `sov-sequencer`: the SDK sequencer patched to skip empty batches while idle (see `modules/patches/README.md`) |
+| `modules/` | Custom modules, one folder per module (`value-setter` is the example), plus patched SDK crates: `sov-sequencer` (skips empty batches while idle) and `sov-evm` (RPC fix for block-by-hash); see `modules/patches/README.md` |
 | `configs/` | Node config and genesis per DA layer: `mock/` and `celestia/` |
 | `constants.toml` | Chain ID, name, namespaces and gas. These are compiled in and must stay at the root |
 | `explorer/` | Block explorer: one static page that reads the node API |

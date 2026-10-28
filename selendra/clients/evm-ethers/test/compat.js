@@ -7,7 +7,7 @@ import {
 } from "ethers";
 import path from "node:path";
 import { compile } from "../src/compile.js";
-import { CHAIN_ID, SelendraWallet, WS_URL, connect } from "../src/config.js";
+import { CHAIN_ID, WS_URL, connect } from "../src/config.js";
 
 // solc-js installs an unhandledRejection handler that rethrows; replace it so one stray promise can't abort the suite.
 process.removeAllListeners("unhandledRejection");
@@ -38,7 +38,7 @@ const rpc = (m, p = []) => provider.send(m, p);
 const sendTx = async (tx) => (await wallet.sendTransaction(tx)).wait();
 // Throwaway funded account, so raw/odd txs never disturb the main dev key's nonce or code.
 const freshWallet = async (sel = "0.05") => {
-  const w = new SelendraWallet(Wallet.createRandom().privateKey, provider);
+  const w = new Wallet(Wallet.createRandom().privateKey, provider);
   await sendTx({ to: w.address, value: parseEther(sel) });
   return w;
 };

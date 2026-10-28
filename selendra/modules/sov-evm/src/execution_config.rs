@@ -1,0 +1,55 @@
+//! Provides configuration for native EVM execution.
+use sov_modules_api::ExecutionInit;
+use sov_modules_api::ModuleExecutionConfig;
+use sov_modules_api::Spec;
+use std::sync::OnceLock;
+
+use crate::Evm;
+
+/// Global storage for the EVM execution configuration.
+///
+/// Process-scoped: [`ModuleExecutionConfig::configure`] uses [`OnceLock::set`],
+/// which is a one-shot per process. In production each node runs in its own
+/// process so this is fine. In the test harness we rely on `cargo nextest`
+/// (see `.config/nextest.toml`), which isolates every `#[tokio::test]` in a
+/// fresh process — giving each test a virgin `OnceLock`. Invoking these
+/// tests via `cargo test` (which shares a process per test binary) would
+/// panic on the second call and is not supported.
+pub static EVM_EXECUTION_CONFIG: OnceLock<EvmExecutionConfig> = OnceLock::new();
+
+/// Configuration for native EVM execution.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+pub struct EvmExecutionConfig {
+    /// Whether to publish reverted transactions to the DA layer.
+    #[serde(default)]
+    pub preferred_sequencer_publish_reverted_txs: bool,
+}
+
+impl<S: Spec, P> ExecutionInit for Evm<S, P>
+where
+    P: crate::precompiles::EvmPrecompileSet<S>,
+{
+    type Config = EvmExecutionConfig;
+    // Do nothing; the configure function handles everything we need.
+    fn init(_config: &Self::Config) -> Result<(), Box<dyn std::error::Error>> {
+        Ok(())
+    }
+}
+
+impl ModuleExecutionConfig for EvmExecutionConfig {
+    type Input = std::path::PathBuf;
+    fn configure(input: &Self::Input) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if !std::fs::exists(input)? {
+            std::fs::write(
+                input,
+                serde_json::to_string_pretty(&EvmExecutionConfig::default())?,
+            )?;
+        }
+        let file = std::fs::read(input)?;
+        let config: EvmExecutionConfig = serde_json::from_slice(&file)?;
+        EVM_EXECUTION_CONFIG.set(config).map_err(|_| {
+            "EVM Execution config already initialized. This is a bug, please report it."
+        })?;
+        Ok(())
+    }
+}

@@ -10,7 +10,8 @@ npm run watch -- <token-address>   # live blocks + Transfer events (WebSocket)
 npm run compat                     # EVM compatibility suite (65 checks + known differences)
 ```
 
-Put your contracts in `contracts/`. Use `connect()` from `src/config.js` in your own scripts. It returns a
-`SelendraWallet`, which handles Selendra's short nonce lag after soft confirmations.
+Put your contracts in `contracts/`. Use `connect()` from `src/config.js` in your own scripts. It returns an ethers
+provider and wallet with ethers' request cache turned off (`cacheTimeout: -1`), which back-to-back sends need on
+Selendra (see "Back-to-back sends with ethers" in `docs/EVM.md`).
 
 Full guide, with viem, Hardhat, Foundry, MetaMask and the supported RPC methods: [`../../docs/EVM.md`](../../docs/EVM.md).

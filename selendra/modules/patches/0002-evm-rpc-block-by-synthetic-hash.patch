@@ -1,0 +1,21 @@
+--- a/src/rpc/block_resolution.rs
++++ b/src/rpc/block_resolution.rs
+@@ -458,8 +458,17 @@
+                     // Case 1: The synthetic block has the same block number as the pending block;
+                     // that's a harder special case where we need to populate its fields from
+                     // the pending block.
++                    // Selendra: skip this case once the block is sealed. Between `finalize_hook` (which seals
++                    // the block and clears the pending txs) and the next `begin_rollup_block_hook`, `block_env`
++                    // still has the sealed block's number, so this case would report the block as missing.
++                    // Case 2 rebuilds it from the sealed block, as `get_maybe_sealed_block` does.
+                     let block_env = self.block_env(state).unwrap_infallible();
+-                    if block_env.number == block_number {
++                    let is_sealed = self
++                        .blocks
++                        .get(&block_number, state)
++                        .unwrap_infallible()
++                        .is_some();
++                    if block_env.number == block_number && !is_sealed {
+                         let Some(mut newest_pending_block) =
+                             self.pending_block(Some(block_env), state)
+                         else {
