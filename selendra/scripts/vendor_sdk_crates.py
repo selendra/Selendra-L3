@@ -32,7 +32,11 @@ CRATES = {
     ),
     "sov-stf-runner": (
         "crates/full-node/sov-stf-runner",
-        ["0003-stf-runner-restart-with-proof-backlog.patch"],
+        ["0003-stf-runner-restart-with-proof-backlog.patch", "0005-stf-runner-skip-proofs-already-accepted.patch"],
+    ),
+    "sov-chain-state": (
+        "crates/module-system/module-implementations/sov-chain-state",
+        ["0004-chain-state-record-charged-gas-price.patch"],
     ),
 }
 

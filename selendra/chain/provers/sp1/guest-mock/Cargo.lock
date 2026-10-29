@@ -6273,7 +6273,6 @@ dependencies = [
 [[package]]
 name = "sov-chain-state"
 version = "0.3.0"
-source = "git+https://github.com/Sovereign-Labs/sovereign-sdk.git?rev=f1a2dc3980d102abe0d457692afc9f3bac6e51a5#f1a2dc3980d102abe0d457692afc9f3bac6e51a5"
 dependencies = [
  "anyhow",
  "borsh",
@@ -7345,6 +7344,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 name = "stf-starter"
 version = "0.3.0"
 dependencies = [
+ "alloy-consensus",
  "anyhow",
  "borsh",
  "serde_json",

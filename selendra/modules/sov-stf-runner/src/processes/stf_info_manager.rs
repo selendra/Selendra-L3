@@ -509,6 +509,11 @@ pub struct CursorHandle {
 }
 
 impl CursorHandle {
+    /// Selendra: the next height the consumer will receive, i.e. the first slot of the next proof window.
+    pub fn next_height_to_receive(&self) -> SlotNumber {
+        SlotNumber::new(self.next_height_to_receive.load(Ordering::SeqCst))
+    }
+
     /// Increment next height to receive by the requested amount, returning the previous value.
     pub fn inc_next_height_to_receive_by(&self, amount: u64) -> SlotNumber {
         SlotNumber::new(

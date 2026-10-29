@@ -22,6 +22,50 @@ use crate::processes::{CursorHandle, ProverService, Receiver};
 
 mod types;
 
+/// Selendra: final slot of the latest aggregated proof this node has seen accepted on-chain (from DA), or 0.
+/// Updated by the runner; read by the aggregator to avoid re-posting proofs the chain already has.
+static LATEST_ACCEPTED_PROOF_FINAL_SLOT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Records that an aggregated proof ending at `final_slot` was accepted on-chain.
+pub fn record_accepted_proof_final_slot(final_slot: sov_rollup_interface::common::SlotNumber) {
+    LATEST_ACCEPTED_PROOF_FINAL_SLOT.fetch_max(final_slot.get(), std::sync::atomic::Ordering::SeqCst);
+}
+
+fn latest_accepted_proof_final_slot() -> u64 {
+    LATEST_ACCEPTED_PROOF_FINAL_SLOT.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// After this long, the aggregator warns if the proofs it posted before a restart are still not accepted on-chain.
+/// It does not re-post them: the preferred sequencer persists proof blobs and re-dispatches them at startup until they
+/// land (measured: up to 13 DA blocks later), and waiting for them here would stall the runner through back-pressure.
+const STARTUP_IN_FLIGHT_WARN_AFTER: Duration = Duration::from_secs(120);
+
+/// Selendra: file in which the aggregator records the final slot of the last proof it posted (set by the node).
+static POSTED_PROOF_RECORD: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+/// Sets the file recording the final slot of the last aggregated proof this node posted, kept across restarts.
+pub fn set_posted_proof_record_path(path: std::path::PathBuf) {
+    let _ = POSTED_PROOF_RECORD.set(path);
+}
+
+fn read_last_posted_proof_final_slot() -> u64 {
+    POSTED_PROOF_RECORD
+        .get()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| text.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+fn record_posted_proof_final_slot(final_slot: u64) {
+    let Some(path) = POSTED_PROOF_RECORD.get() else {
+        return;
+    };
+    let tmp = path.with_extension("tmp");
+    if let Err(error) = std::fs::write(&tmp, final_slot.to_string()).and_then(|()| std::fs::rename(&tmp, path)) {
+        tracing::warn!(%error, path = %path.display(), "Failed to record the last posted aggregated proof");
+    }
+}
+
 const BACKOFF_POLICY_MIN_DELAY: u64 = 1;
 const BACKOFF_POLICY_MAX_DELAY: u64 = 60;
 const BACKOFF_POLICY_MAX_NUM_RETRIES: usize = 5;
@@ -105,6 +149,8 @@ where
                 metadata_rx,
                 cursor: cursor.clone(),
                 primary_shutdown: self.primary_shutdown,
+                posted_before_restart: read_last_posted_proof_final_slot(),
+                warn_after: Some(tokio::time::Instant::now() + STARTUP_IN_FLIGHT_WARN_AFTER),
             };
 
             let aggregator_shutdown_controller = self.secondary_shutdown_controller.clone();
@@ -332,6 +378,10 @@ struct AggregatorTask<Ps: ProverService> {
     metadata_rx: mpsc::Receiver<(AggregateProofMetadata<Ps>, u64)>,
     cursor: CursorHandle,
     primary_shutdown: PrimaryShutdownController,
+    /// Final slot of the last proof this node posted before it (re)started, from the posted-proof record.
+    posted_before_restart: u64,
+    /// When to check that the proofs posted before the restart were accepted (see [`STARTUP_IN_FLIGHT_WARN_AFTER`]).
+    warn_after: Option<tokio::time::Instant>,
 }
 
 impl<Ps: ProverService> AggregatorTask<Ps>
@@ -375,6 +425,25 @@ where
                 });
             });
 
+            // Selendra: after a restart the node resumes from the last proof accepted on-chain and re-proves the
+            // slots after it, but it already posted proofs for some of them (accepted since, or re-dispatched by the
+            // sequencer). Re-posting those gets the prover penalized for duplicates, so skip windows the chain has
+            // accepted or this node posted before the restart. The proof is still created above, so the outer proof
+            // chain stays intact for the next window.
+            let final_slot = self.cursor.next_height_to_receive().get() + window_size - 1;
+            self.warn_if_proofs_from_before_restart_are_missing();
+            let latest_accepted = latest_accepted_proof_final_slot();
+            if final_slot <= latest_accepted.max(self.posted_before_restart) {
+                tracing::info!(
+                    final_slot,
+                    latest_accepted,
+                    posted_before_restart = self.posted_before_restart,
+                    "Not posting aggregated proof: already accepted on-chain or posted before the restart"
+                );
+                self.cursor.inc_next_height_to_receive_by(window_size);
+                continue;
+            }
+
             tracing::debug!(
                 bytes = agg_proof.raw_aggregated_proof.len(),
                 "Sending aggregated proof to DA"
@@ -383,11 +452,32 @@ where
             self.proof_sender
                 .publish_proof_blob_with_metadata(agg_proof)
                 .await?;
+            record_posted_proof_final_slot(final_slot);
 
             self.cursor.inc_next_height_to_receive_by(window_size);
         }
         tracing::debug!("Aggregator task has been completed");
         Ok(())
+    }
+
+    /// Warns once if, [`STARTUP_IN_FLIGHT_WARN_AFTER`] after startup, the chain still has not accepted the proofs
+    /// this node posted before the restart.
+    fn warn_if_proofs_from_before_restart_are_missing(&mut self) {
+        let Some(warn_after) = self.warn_after else {
+            return;
+        };
+        if tokio::time::Instant::now() < warn_after {
+            return;
+        }
+        self.warn_after = None;
+        let latest_accepted = latest_accepted_proof_final_slot();
+        if latest_accepted < self.posted_before_restart {
+            tracing::warn!(
+                posted_before_restart = self.posted_before_restart,
+                latest_accepted,
+                "Proofs posted before the restart are still not accepted on-chain; check the proof blob sender"
+            );
+        }
     }
 }
 

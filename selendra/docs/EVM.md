@@ -143,6 +143,7 @@ Ethereum (plus the block-timestamp behaviour found afterwards, #7), and 24 optio
 | 5 | **`SELFDESTRUCT` of a contract created in the same tx fails** (`selfdestruct unsupported`), where Ethereum would delete it. `SELFDESTRUCT` on older contracts works (EIP-6780 behaviour). | The opcode is deprecated; avoid factory patterns that create and destroy in one tx. |
 | 6 | **ethers reuses a cached nonce on back-to-back sends** (described below). Not a node issue. | Create ethers providers with `cacheTimeout: -1` (`connect()` does). |
 | 7 | **On an idle chain, EVM blocks and `block.timestamp` advance in steps.** New EVM blocks come with rollup batches. While idle, Selendra posts an empty batch only every ~19 DA blocks (~2 min; see `modules/patches/README.md`), and a block's timestamp is that of the last block with txs. Measured before the batch patch: 612 s stale before a tx, 20 s after. | Don't rely on `block.timestamp` in `eth_call`/view functions being current on a quiet chain. Pass the time in from the client, or check it inside a transaction. |
+| 8 | **On a brand-new chain, EVM calls fail until the first rollup block** (`eth_estimateGas` → `EVM transaction error: Header(PrevrandaoNotSet)`). With no transactions, the first batch comes ~20 DA blocks (~2 min) after genesis (row 7), and an EVM wallet can't trigger it because its own gas estimate fails. Proving also starts only after that first block. | Wait ~2 min after starting a new chain, or send one native transaction first (e.g. `make selendra-tx`). |
 
 ### ❌ Not available (N/A)
 

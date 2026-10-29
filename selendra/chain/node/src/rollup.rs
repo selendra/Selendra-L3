@@ -180,6 +180,12 @@ impl FullNodeBlueprint<Native> for StarterRollup<Native> {
             }
         }
 
+        // Selendra: lets the aggregator avoid re-posting, after a restart, proofs it already posted (they would be
+        // penalized as duplicates). Kept in the storage directory so a resync from genesis clears it too.
+        sov_stf_runner::processes::set_posted_proof_record_path(
+            rollup_config.storage.path.join("selendra-last-posted-proof"),
+        );
+
         let previous_for_outer = if start_fresh_outer_proof_on_resync {
             None
         } else {

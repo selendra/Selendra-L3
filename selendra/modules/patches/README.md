@@ -8,9 +8,10 @@ section of the root `Cargo.toml`.
 |---|---|---|
 | `sov-sequencer` (in `modules/sov-sequencer`) | `0001-skip-empty-batches-while-idle.patch` (this folder) | Don't post an empty batch to Celestia on every DA block |
 | `sov-evm` (in `modules/sov-evm`) | `0002-evm-rpc-block-by-synthetic-hash.patch` (this folder) | `eth_getBlockByHash` returned "block not found" for a just-sealed block |
-| `sov-stf-runner` (in `modules/sov-stf-runner`) | `0003-stf-runner-restart-with-proof-backlog.patch` (this folder) | A prover node whose proofs were not accepted on-chain could not restart |
+| `sov-stf-runner` (in `modules/sov-stf-runner`) | `0003-stf-runner-restart-with-proof-backlog.patch`, `0005-stf-runner-skip-proofs-already-accepted.patch` (this folder) | A prover node whose proofs were not accepted on-chain could not restart; a restarted prover was penalized for re-posting proofs |
+| `sov-chain-state` (in `modules/sov-chain-state`) | `0004-chain-state-record-charged-gas-price.patch` (this folder) | Valid proofs were rejected because the prover reward exceeded the fees paid in. **Consensus change** |
 
-`modules/sov-sequencer/`, `modules/sov-evm/` and `modules/sov-stf-runner/` are **generated** by `scripts/vendor_sdk_crates.py` (the crate list
+`modules/sov-sequencer/`, `modules/sov-evm/`, `modules/sov-stf-runner/` and `modules/sov-chain-state/` are **generated** by `scripts/vendor_sdk_crates.py` (the crate list
 and each crate's patches are in `CRATES` at the top of the script). Don't edit them by hand: edit, then regenerate
 the `.patch` (see below).
 
@@ -86,6 +87,54 @@ STF info, or `Slot number discontinuity` in the aggregation circuit.
 **Recovering proving.** Make sure the prover is bonded (`npm run prover-bond -- register <amount>` in
 `clients/starter-js`), then resync the node from genesis with `SOV_PROVER_MODE=prove` (empty `storage.path`). Measured:
 proofs accepted again, no slashing.
+
+## 0004 — prover reward computed at the price actually charged (consensus change)
+
+**Problem.** Valid aggregated proofs were rejected with `Error occurred when rewarding the prover … Underflow`.
+Measured on a fresh local chain after the compat suite: the reward owed for a slot was 150,681,772 but the prover
+pool held 137,598,825.
+
+**Cause.** Transactions in a slot are charged the base fee of the *rollup block* being built
+(`base_fee_per_gas` in `sov-modules-stf-blueprint`), but the slot record (`SlotInformation`) keeps the base fee set
+when the true (DA) slot began. With soft confirmations the two differ (measured: charged 7, recorded 8). The prover
+and attester rewards are `gas_used * gas_price` of the slot record, so whenever the recorded price is higher the
+reward exceeds the fees that were paid into the pool.
+
+**Fix** (`finalize_chain_state` in `src/capabilities.rs`). When the slot's gas used is recorded, also record the
+price actually charged in that slot. Only the prover and attester rewards read that price.
+
+**Consensus.** This changes the stored slot records and therefore state roots: every node and the ZK guest programs
+must run it, and the chain must start from genesis (or use an activation height on a live network). The guest
+workspaces (`chain/provers/*/guest-*/Cargo.toml`) patch `sov-chain-state` too; rebuild the guest ELFs (the
+committed SP1 ELFs predate this and the EVM gas-limit check in `chain/stf`).
+
+**Measured after the fix.** Same workload on a fresh chain: all slots proven, 0 reward failures, and the slot records
+carry the charged price (7).
+
+## 0005 — a restarted prover no longer re-posts proofs (no duplicate penalty)
+
+**Problem.** After every restart the prover was penalized for duplicate proofs (measured: 4 per restart, ~280-560 of
+a 200,000 bond). The node resumes from the last proof *accepted* on-chain and re-proves the slots after it, but proofs
+for those slots were already posted before the restart: the preferred sequencer re-dispatches them at startup
+(measured landing up to 13 DA blocks later).
+
+**Fix.**
+- The runner records the final slot of every aggregated proof accepted on-chain.
+- The aggregator records the final slot of each proof it posts in `<storage.path>/selendra-last-posted-proof`
+  (path set by `chain/node`; a resync from genesis clears it with the storage directory).
+- It does not post a window whose final slot is at or below the latest accepted proof or the last proof it posted
+  before the restart. Those proofs land anyway: the preferred sequencer persists proof blobs and re-dispatches them at
+  startup. The proof is still created, so the outer proof chain stays intact.
+- It never waits for them: waiting stalled the runner through back-pressure (it may advance only
+  `max_number_of_transitions_in_memory` slots ahead of the prover), so they were never processed and 25 duplicates
+  were posted in a test with a small limit. After 120 s it only warns if they are still not accepted.
+
+**Measured.** 4 duplicate penalties per restart before; after: 0 in 6 restarts (production limits) and 0 in a restart
+with `max_number_of_transitions_in_db = 6` and proofs pending. Bond unchanged, proofs accepted continuously.
+
+**Limit.** `max_number_of_transitions_in_db` must stay above the number of proofs posted but not yet finalized
+(~10 locally). Below that, the proving data for them is pruned before a restart and the node starts with proving
+disabled (`Cannot resume proving`, see 0003), as seen with the test limit of 6.
 
 ## Updating after an SDK upgrade
 

@@ -1,0 +1,17 @@
+--- a/src/capabilities.rs
++++ b/src/capabilities.rs
+@@ -330,6 +330,14 @@
+             .unwrap_infallible()
+             .expect("There should always be a transition in progress");
+ 
++        // Selendra: record the base fee the slot's transactions were actually charged (the rollup block's price, as in
++        // `apply_batches_in_user_space`), not the price set when the slot began. The two differ with soft
++        // confirmations, and the prover/attester rewards (`gas_used * gas_price` of the slot) must match the fees
++        // that were paid into the reward pool, or the pool runs short and valid proofs are rejected.
++        if let Some(charged_price) = self.base_fee_per_gas(state).unwrap_infallible() {
++            in_progress_slot.gas_info =
++                BlockGasInfo::new(*in_progress_slot.gas_info.gas_limit(), charged_price);
++        }
+         in_progress_slot.gas_info.update_gas_used(*gas_used);
+ 
+         self.slots

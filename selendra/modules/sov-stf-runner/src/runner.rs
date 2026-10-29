@@ -220,6 +220,10 @@ where
             proof_manager_config = ?pm_config,
             "Initializing StfRunner");
 
+        if let Some(final_slot) = latest_proof_final_slot {
+            crate::processes::record_accepted_proof_final_slot(final_slot);
+        }
+
         let (stf_info_sender, stf_info_receiver) = if let Some(config) = pm_config {
             validate_proof_manager_config(&config)?;
             let channel = new_stf_info_channel(
@@ -804,9 +808,11 @@ where
         for mut receipt in receipts {
             match &mut receipt.outcome {
                 ProofOutcome::Valid(ProofReceiptContents::AggregateProof(
-                    _public_data,
+                    public_data,
                     raw_proof,
                 )) => {
+                    // Selendra: lets the aggregator skip re-posting proofs the chain already accepted.
+                    crate::processes::record_accepted_proof_final_slot(public_data.final_slot_number);
                     let raw_proof = std::mem::take(raw_proof);
                     aggregated_proofs
                         .all_aggregated_proofs
