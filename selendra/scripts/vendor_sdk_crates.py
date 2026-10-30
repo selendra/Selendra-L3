@@ -25,7 +25,10 @@ SDK_URL = "https://github.com/Sovereign-Labs/sovereign-sdk.git"
 PATCHES = ROOT / "modules" / "patches"
 # crate name -> (path inside the SDK, patches in modules/patches applied in order)
 CRATES = {
-    "sov-sequencer": ("crates/full-node/sov-sequencer", ["0001-skip-empty-batches-while-idle.patch"]),
+    "sov-sequencer": (
+        "crates/full-node/sov-sequencer",
+        ["0001-skip-empty-batches-while-idle.patch", "0006-sequencer-skip-replaying-included-batches.patch"],
+    ),
     "sov-evm": (
         "crates/module-system/module-implementations/sov-evm",
         ["0002-evm-rpc-block-by-synthetic-hash.patch"],

@@ -3,7 +3,7 @@
 use anyhow::Context;
 use clap::Parser;
 use rollup_starter::da::DaService;
-use rollup_starter::rollup::{CannotResumeProving, StarterRollup};
+use rollup_starter::rollup::{enable_resume_proving_check, CannotResumeProving, StarterRollup};
 use sov_modules_rollup_blueprint::logging::initialize_logging;
 use sov_modules_rollup_blueprint::FullNodeBlueprint;
 use sov_modules_rollup_blueprint::Rollup;
@@ -119,6 +119,9 @@ async fn main() {
 
     let prover_config = parse_prover_config().expect("Malformed prover_config");
     tracing::info!(?prover_config, "Running demo rollup with prover config");
+    if prover_config.is_enabled() && !args.start_fresh_outer_proof_on_resync {
+        enable_resume_proving_check();
+    }
 
     let rollup = match new_rollup(
         args.genesis_path,

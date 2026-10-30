@@ -1,0 +1,33 @@
+--- a/src/preferred/update_state.rs
++++ b/src/preferred/update_state.rs
+@@ -134,6 +134,30 @@
+             for blob in completed_blobs {
+                 match blob {
+                     PreferredBlobToReplay::Batch(batch) => {
++                        // Selendra patch: the visible slot strictly increases with every batch, so a batch whose
++                        // target visible slot is not past the replay checkpoint's is already part of the node state.
++                        // Seen right after a restart, when the node applies the first DA block while the sequencer
++                        // starts up: the node's next sequence number read here lagged that state, and replaying the
++                        // included batch failed the "visible slot number calculation was incorrect" assertion,
++                        // killing the node. Skip such batches (and the proofs before them) instead.
++                        let node_visible_slot_number =
++                            sov_modules_api::VersionReader::current_visible_slot_number(
++                                &executor.checkpoint,
++                            );
++                        if batch.visible_slot_number_after_increase <= node_visible_slot_number {
++                            tracing::warn!(
++                                sequence_number = batch.batch.inner.sequence_number,
++                                batch_visible_slot_number = %batch.visible_slot_number_after_increase,
++                                %node_visible_slot_number,
++                                "Not replaying a batch that the node state already includes"
++                            );
++                            min_sequence_number_of_open_batch =
++                                batch.batch.inner.sequence_number.saturating_add(1);
++                            unprocessed_proofs.retain(|sequence_number, _| {
++                                *sequence_number > batch.batch.inner.sequence_number
++                            });
++                            continue;
++                        }
+                         batches_count += 1;
+                         transactions_count += batch.batch.inner.data.len();
+                         min_sequence_number_of_open_batch =

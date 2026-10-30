@@ -128,6 +128,25 @@ impl FullNodeBlueprint<Native> for StarterRollup<Native> {
         new_da_service::<Self::Spec>(rollup_config, secondary_shutdown_controller).await
     }
 
+    fn create_ledger_db(
+        &self,
+        ledger_state: <Self::StorageManager as sov_rollup_interface::storage::HierarchicalStorageManager<
+            DaSpec,
+        >>::LedgerState,
+    ) -> anyhow::Result<LedgerDb> {
+        let ledger_db = LedgerDb::with_reader(ledger_state)?;
+        // Selendra: checked here rather than in `create_prover_service` because the blueprint creates the ledger DB
+        // before the sequencer. A failure after the sequencer has started tears it down mid-startup (it may already
+        // have built or published a batch) right before the binary re-execs, and the restarted sequencer then failed
+        // its batch replay ("visible slot number calculation was incorrect").
+        if RESUME_PROVING_CHECK.load(std::sync::atomic::Ordering::Relaxed) {
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(check_can_resume_proving(&ledger_db))
+            })?;
+        }
+        Ok(ledger_db)
+    }
+
     async fn create_prover_service(
         &self,
         _prover_config: RollupProverConfig,
@@ -158,32 +177,13 @@ impl FullNodeBlueprint<Native> for StarterRollup<Native> {
 
         let latest_proof_final_slot = previous_public_data.as_ref().map(|p| p.final_slot_number);
 
-        // Selendra: if any STF info after the last accepted aggregated proof is gone, this node cannot extend the
-        // proof chain. That happens when the chain stops accepting its proofs (e.g. the prover bond ran out): the
-        // node keeps proving, its proofs are rejected, and the STF infos they used get pruned. Resuming then panics
-        // in the SDK (missing STF info, or the aggregation's slot-continuity assertion), and a fresh outer proof gets
-        // the prover slashed (IncorrectGenesisHash), so refuse to start proving with an actionable error instead.
-        // `--start-fresh-outer-proof-on-resync` keeps the SDK behaviour.
-        if !start_fresh_outer_proof_on_resync {
-            if let Some(final_slot) = latest_proof_final_slot {
-                if let Some((missing, last)) =
-                    first_missing_stf_info(ledger_db, final_slot.next()).await?
-                {
-                    return Err(CannotResumeProving(format!(
-                        "the last accepted aggregated proof ends at slot {final_slot}, but the proving data (STF \
-                         info) for slot {missing} is not stored (needed up to slot {last}), so this node \
-                         cannot extend the proof chain. Check that the prover is bonded, then resync this node from \
-                         genesis with proving enabled (or let another prover take over)."
-                    ))
-                    .into());
-                }
-            }
-        }
-
         // Selendra: lets the aggregator avoid re-posting, after a restart, proofs it already posted (they would be
         // penalized as duplicates). Kept in the storage directory so a resync from genesis clears it too.
         sov_stf_runner::processes::set_posted_proof_record_path(
-            rollup_config.storage.path.join("selendra-last-posted-proof"),
+            rollup_config
+                .storage
+                .path
+                .join("selendra-last-posted-proof"),
         );
 
         let previous_for_outer = if start_fresh_outer_proof_on_resync {
@@ -310,7 +310,46 @@ async fn read_latest_aggregated_proof(ledger_db: &LedgerDb) -> Option<Serialized
     )
 }
 
-/// Proving cannot resume from the last accepted aggregated proof (see `create_prover_service`).
+static RESUME_PROVING_CHECK: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Makes rollup startup fail with [`CannotResumeProving`] if this node cannot extend the proof chain. Call it before
+/// creating the rollup when proving is enabled, unless `--start-fresh-outer-proof-on-resync` is set (that flag keeps
+/// the SDK behaviour).
+pub fn enable_resume_proving_check() {
+    RESUME_PROVING_CHECK.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// If any STF info after the last accepted aggregated proof is gone, this node cannot extend the proof chain. That
+/// happens when the chain stops accepting its proofs (e.g. the prover bond ran out): the node keeps proving, its
+/// proofs are rejected, and the STF infos they used get pruned. Resuming then panics in the SDK (missing STF info, or
+/// the aggregation's slot-continuity assertion), and a fresh outer proof gets the prover slashed
+/// (IncorrectGenesisHash), so refuse to start proving with an actionable error instead.
+async fn check_can_resume_proving(ledger_db: &LedgerDb) -> anyhow::Result<()> {
+    let Some(proof) = read_latest_aggregated_proof(ledger_db).await else {
+        return Ok(());
+    };
+    let public_data: AggregatedProofPublicData<
+        EthereumAddress,
+        DaSpec,
+        <NativeStorage as Storage>::Root,
+    > = MockZkVerifier::extract_public_data(&proof.to_serialized_zk_proof()).map_err(|e| {
+        anyhow::anyhow!("Failed to extract public data from persisted aggregated proof: {e:?}")
+    })?;
+    let final_slot = public_data.final_slot_number;
+    if let Some((missing, last)) = first_missing_stf_info(ledger_db, final_slot.next()).await? {
+        return Err(CannotResumeProving(format!(
+            "the last accepted aggregated proof ends at slot {final_slot}, but the proving data (STF info) for slot \
+             {missing} is not stored (needed up to slot {last}), so this node cannot extend the proof chain. Check \
+             that the prover is bonded, then resync this node from genesis with proving enabled (or let another \
+             prover take over)."
+        ))
+        .into());
+    }
+    Ok(())
+}
+
+/// Proving cannot resume from the last accepted aggregated proof (see `check_can_resume_proving`).
 /// The rollup binary catches it and starts the node without the proof pipeline.
 #[derive(Debug)]
 pub struct CannotResumeProving(String);

@@ -6,7 +6,7 @@ section of the root `Cargo.toml`.
 
 | Crate | Patches | Why |
 |---|---|---|
-| `sov-sequencer` (in `modules/sov-sequencer`) | `0001-skip-empty-batches-while-idle.patch` (this folder) | Don't post an empty batch to Celestia on every DA block |
+| `sov-sequencer` (in `modules/sov-sequencer`) | `0001-skip-empty-batches-while-idle.patch`, `0006-sequencer-skip-replaying-included-batches.patch` (this folder) | Don't post an empty batch to Celestia on every DA block; a restarted node could die replaying a batch it already had |
 | `sov-evm` (in `modules/sov-evm`) | `0002-evm-rpc-block-by-synthetic-hash.patch` (this folder) | `eth_getBlockByHash` returned "block not found" for a just-sealed block |
 | `sov-stf-runner` (in `modules/sov-stf-runner`) | `0003-stf-runner-restart-with-proof-backlog.patch`, `0005-stf-runner-skip-proofs-already-accepted.patch` (this folder) | A prover node whose proofs were not accepted on-chain could not restart; a restarted prover was penalized for re-posting proofs |
 | `sov-chain-state` (in `modules/sov-chain-state`) | `0004-chain-state-record-charged-gas-price.patch` (this folder) | Valid proofs were rejected because the prover reward exceeded the fees paid in. **Consensus change** |
@@ -76,10 +76,11 @@ STF info, or `Slot number discontinuity` in the aggregation circuit.
 **Fix, in two parts.**
 - This patch: the startup check on the number of stored STF infos warns instead of panicking (the running node only
   warns about the same condition), so a node that still has all the data resumes the proof chain.
-- `chain/node` (not a patch): before proving starts, `create_prover_service` checks that every STF info from the last
-  accepted proof up to the head is stored. If one is missing the node cannot extend the proof chain, so the binary
-  logs `Cannot resume proving: …` and re-executes itself with proving disabled: the node (and its sequencer) keeps
-  running.
+- `chain/node` (not a patch): at startup, when the ledger DB is opened (`create_ledger_db`, before the sequencer
+  starts), the node checks that every STF info from the last accepted proof up to the head is stored. If one is
+  missing the node cannot extend the proof chain, so the binary logs `Cannot resume proving: …` and re-executes itself
+  with proving disabled: the node (and its sequencer) keeps running. The check runs before the sequencer so that
+  nothing it started (batches, blob submissions) is torn down mid-startup by the re-exec.
 
 **Not done on purpose.** Starting a fresh outer proof from the stored data gets the prover **slashed**
 (`IncorrectGenesisHash`, measured), so the node never does that on its own.
@@ -136,6 +137,28 @@ with `max_number_of_transitions_in_db = 6` and proofs pending. Bond unchanged, p
 (~10 locally). Below that, the proving data for them is pruned before a restart and the node starts with proving
 disabled (`Cannot resume proving`, see 0003), as seen with the test limit of 6.
 
+## 0006 — a restarted node could die replaying a batch it already had
+
+**Problem.** Seen twice in restarts of a proving node with proof blobs still in flight (both times the node then fell
+back to proving disabled, see 0003): the node died about a second after starting, with 3 panics, the first being
+`Sanity check failed: visible slot number calculation was incorrect` (`left: 93, right: 91`). The node had just applied
+the first DA block (batch 123, visible slot 92). At the same moment the sequencer's startup replay (soft confirmations
+on top of the node state) began at an older sequence number, so it re-applied batch 121 (target visible slot 91), which
+that state already included. The sequencer DB itself was consistent (checked with a dump: batches 121/123/125 with
+visible slots 91/92/93, proofs in between). Why the node's next sequence number was read behind the state used for
+the replay was not established: it happens only when the first DA block lands inside the sequencer's startup window,
+and could not be reproduced on demand.
+
+**Fix** (`replay_soft_confirmations_on_top_of_node_state` in `src/preferred/update_state.rs`). The visible slot
+strictly increases with every batch, so a stored batch whose target visible slot is at or below the replay checkpoint's
+is already part of the node state. The replay skips it, and the proofs before it, with a warning:
+`Not replaying a batch that the node state already includes`. Any other mismatch still hits the original assertion.
+
+**Tested** by making the replay start 4 sequence numbers early (a temporary test hack, not in the patch): without the
+fix the node dies with the same 3 panics (`left: 297, right: 291`); with it the node skips the 2 included batches, keeps
+proving (proofs accepted, no penalties) and serves 20/20 transactions. The node also restarts cleanly from the state
+left by the original crash.
+
 ## Updating after an SDK upgrade
 
 ```bash
@@ -154,6 +177,8 @@ cd /tmp && rm -rf a b && cp -r ~/project/selendra/target/sdk-src/<rev>/crates/fu
 diff -ruN a b | sed -e 's#^--- a/\([^\t]*\).*#--- a/src/\1#' -e 's#^+++ b/\([^\t]*\).*#+++ b/src/\1#' \
   > ~/project/selendra/modules/patches/0001-skip-empty-batches-while-idle.patch
 ```
+
+(`sov-sequencer` has two patches: keep the `src/preferred/update_state.rs` hunk in 0006 and the rest in 0001.)
 
 To drop the patch entirely, remove the `[patch...]` section from the root `Cargo.toml` (or set
 `SOV_SEQUENCER_MAX_IDLE_SLOTS=0` to keep the code but disable the behaviour).
